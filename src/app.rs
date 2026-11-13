@@ -712,7 +712,7 @@ impl ColormsApp {
         }
         let hover = ctx.animate_bool_with_time(Id::new((id, "hover")), response.hovered(), 0.12);
         if hover > 0.001 {
-            let bg = match action {
+            let layer = match action {
                 WindowAction::Close => Color32::from_rgba_unmultiplied(
                     theme.danger.r(),
                     theme.danger.g(),
@@ -721,7 +721,12 @@ impl ColormsApp {
                 ),
                 _ => Color32::from_white_alpha((22.0 * hover) as u8),
             };
-            painter.circle_filled(rect.center(), 14.0, bg);
+            // epaint closes a circle fan on an extra segment at angle zero, and
+            // where its fringe triangles overlap a *translucent* fill each layer
+            // adds its alpha again — that is the bright ragged seam on the right
+            // of these buttons. Painting the disc opaque makes the overlap
+            // invisible, so the layer is flattened onto the title bar first.
+            painter.circle_filled(rect.center(), 14.0, over_premultiplied(layer, theme.footer));
         }
 
         let icon_color = match (action, response.hovered()) {
@@ -960,6 +965,21 @@ fn gradient_color_at(layout: &Layout, theme: &Theme, y: f32) -> Color32 {
     let height = layout.content.height().max(1.0);
     let t = ((y - layout.content.top()) / height).clamp(0.0, 1.0);
     theme::lerp_color(theme.surface_top, theme.surface_bottom, t)
+}
+
+/// Composites a premultiplied layer over an opaque colour and drops the alpha
+/// channel. Overlapping translucent geometry (epaint's fan seams, for instance)
+/// becomes invisible once the result is opaque.
+fn over_premultiplied(top: Color32, under: Color32) -> Color32 {
+    let a = top.a() as u32;
+    let rest = 255 - a;
+    let mix =
+        |premult: u8, bottom: u8| -> u8 { (premult as u32 + bottom as u32 * rest / 255) as u8 };
+    Color32::from_rgb(
+        mix(top.r(), under.r()),
+        mix(top.g(), under.g()),
+        mix(top.b(), under.b()),
+    )
 }
 
 /// Blends a translucent colour over an opaque one and drops the alpha channel.

@@ -340,7 +340,7 @@ impl ColormsApp {
         self.draw_preview(&painter, &metrics);
         self.draw_hex_pill(ctx, ui, &layout, &metrics, &theme, now);
         self.draw_copy_card(ctx, ui, &layout, &metrics, &theme, now);
-        self.draw_footer(ctx, ui, &layout, &theme, now);
+        self.draw_footer(ctx, ui, &layout, now);
         self.draw_titlebar(ctx, ui, &layout, &theme, &painter, maximized);
         self.draw_toast(ctx, &painter, &layout, &theme, now);
         self.draw_resize_handles(ctx, ui, &layout, maximized);
@@ -487,30 +487,6 @@ impl ColormsApp {
             StrokeKind::Inside,
         );
 
-        let font_small = ui::font_body((9.8 * layout.scale).clamp(8.6, 13.0));
-        let font_pct = ui::font_mono((9.8 * layout.scale).clamp(8.6, 13.0));
-        let percent = format!("{}%", (self.color.value * 100.0).round() as i32);
-        let w1 = text_width(painter, "明度", font_small.clone());
-        let w2 = text_width(painter, &percent, font_pct.clone());
-        let gap = layout.len(7.0);
-        let total = w1 + gap + w2;
-        let start_x = rect.center().x - total * 0.5;
-        let label_y = layout.point(55.913, 24.5).y;
-        painter.text(
-            pos2(start_x, label_y),
-            Align2::LEFT_CENTER,
-            "明度",
-            font_small,
-            theme.text_muted,
-        );
-        painter.text(
-            pos2(start_x + w1 + gap, label_y),
-            Align2::LEFT_CENTER,
-            percent,
-            font_pct,
-            theme.text,
-        );
-
         // A small knob on the wheel side of the capsule makes the current
         // brightness obvious at a glance and mirrors Material sliders.
         let knob_center = pos2(
@@ -643,66 +619,23 @@ impl ColormsApp {
         painter.rect_stroke(metrics.copy_front, radius, stroke, StrokeKind::Inside);
     }
 
-    fn draw_footer(
-        &mut self,
-        ctx: &egui::Context,
-        ui: &Ui,
-        layout: &Layout,
-        theme: &Theme,
-        now: f64,
-    ) {
+    fn draw_footer(&mut self, ctx: &egui::Context, ui: &Ui, layout: &Layout, now: f64) {
         let footer = layout.footer;
         if footer.height() < 8.0 {
             return;
         }
         let painter = ui.painter();
         let center_y = footer.center().y;
-        let label_font = ui::font_display(10.5);
-        let label = "最近";
-        painter.text(
-            pos2(footer.left() + 24.0, center_y),
-            Align2::LEFT_CENTER,
-            label,
-            label_font.clone(),
-            theme.text_muted,
-        );
-        let label_w = text_width(painter, label, label_font);
-        let dots_left = footer.left() + 24.0 + label_w + 18.0;
-
-        let hint_font = ui::font_body(9.5);
-        let hint = "点击恢复 · 右键删除";
-        let hint_w = text_width(painter, hint, hint_font.clone());
-        let show_hint = footer.width() >= 560.0;
-        let hint_left = footer.right() - 24.0 - hint_w;
-        if show_hint && !self.recent.is_empty() {
-            painter.text(
-                pos2(hint_left, center_y),
-                Align2::LEFT_CENTER,
-                hint,
-                hint_font,
-                theme.text_muted,
-            );
-        }
+        let dots_left = footer.left() + 24.0;
+        let right_limit = footer.right() - 20.0;
 
         if self.recent.is_empty() {
-            painter.text(
-                pos2(dots_left, center_y),
-                Align2::LEFT_CENTER,
-                "调整颜色后会自动记录",
-                ui::font_body(10.0),
-                theme.text_muted,
-            );
             return;
         }
 
         let radius = 7.5;
         let gap = 9.0;
         let step = radius * 2.0 + gap;
-        let right_limit = if show_hint {
-            hint_left - 16.0
-        } else {
-            footer.right() - 20.0
-        };
         let max_dots = (((right_limit - dots_left + gap) / step).floor().max(0.0) as usize).min(12);
         let count = self.recent.len().min(max_dots);
         if count == 0 {
@@ -1137,13 +1070,6 @@ fn gradient_color_at(layout: &Layout, theme: &Theme, y: f32) -> Color32 {
     let height = layout.content.height().max(1.0);
     let t = ((y - layout.content.top()) / height).clamp(0.0, 1.0);
     theme::lerp_color(theme.surface_top, theme.surface_bottom, t)
-}
-
-fn text_width(painter: &egui::Painter, text: &str, font: egui::FontId) -> f32 {
-    painter
-        .layout_no_wrap(text.to_owned(), font, Color32::WHITE)
-        .size()
-        .x
 }
 
 pub fn build_font_definitions() -> FontDefinitions {

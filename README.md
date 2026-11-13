@@ -17,9 +17,10 @@
   点击圆点恢复，右键删除。
 - **动态主题**：背景、复制按钮、描边随当前颜色生成 Material You 暗色配色。
 - **无边框自适应窗口**：自定义标题栏 / 最小化 / 最大化 / 关闭，
-  6px 边缘拖拽调整大小；Windows 下用窗口区域（`SetWindowRgn`）裁出圆角，
-  并去掉原生标题栏、禁用 DWM 过渡，启动底色为 `#202020`，避免白窗闪烁。
-  最底部固定为 `#202020`。
+  6px 边缘拖拽调整大小；Windows 下用**分层窗口**（`WS_EX_LAYERED` +
+  `UpdateLayeredWindow`，逐像素 alpha）呈现，圆角因此是真抗锯齿的，
+  窗口本身没有原生边框；同时去掉原生标题栏、禁用 DWM 过渡与自带圆角，
+  首帧画完才显示窗口，避免白窗闪烁。最底部固定为 `#202020`。
 
 ## 快捷键
 
@@ -36,14 +37,14 @@
 | 版本 | 中位数 | 范围 |
 | --- | --- | --- |
 | 旧版（eframe / OpenGL） | 344 ms | 330–351 ms |
-| 当前版本（CPU 光栅 + GDI） | **65 ms** | 64–82 ms |
+| 当前版本（CPU 光栅 + 分层窗口） | **65 ms** | 64–82 ms |
 
 约 **5.3×** 的提升，主要来自不再初始化 GPU 驱动：
 
 - 不链接 `eframe` / `glutin` / `egui_glow`，改用 `winit` + `egui-winit` 自建窗口壳，
   跳过 `ChoosePixelFormat` + `wglMakeCurrent`（本机约 210 ms 的 GL ICD 初始化）。
 - 自研 CPU 三角形光栅器（`src/gfx.rs`）把 egui 的三角网格画进 BGRA DIB，
-  再用 GDI `BitBlt` 提交，全程不碰 GPU。全窗口渐变、环境光晕都走整行常量快路径，
+  再通过分层窗口（`UpdateLayeredWindow`）提交，全程不碰 GPU。全窗口渐变、环境光晕都走整行常量快路径，
   光晕预烘焙成一张 128² 径向 alpha 贴图（原来的 16 层同心圆叠加合并成一次采样）。
 - 启动路径上没有 SQLite：数据库在后台线程打开，窗口先用默认尺寸创建并居中，
   数据就绪后再套用保存的尺寸；任务栏图标也是首帧之后再装（省 ~15 ms）。
@@ -57,7 +58,7 @@
 ## 技术栈
 
 - GUI：`egui` / `egui-winit` 0.33.3，窗口壳用 `winit` 0.30 + 手写 Win32 FFI（无 eframe）
-- 渲染：自研 CPU 三角光栅器（`src/gfx.rs`）+ GDI `BitBlt` 提交（`src/platform.rs`）
+- 渲染：自研 CPU 三角光栅器（`src/gfx.rs`）+ 分层窗口逐像素 alpha 提交（`src/platform.rs`）
 - 存储：`rusqlite` 0.37（bundled SQLite，WAL 模式）
 - 序列化：`serde` / `serde_json`
 - 错误处理：`thiserror`（数据层）+ `anyhow`（应用层）
@@ -68,7 +69,7 @@
 需要 Rust 1.88+ 和可用的 C 工具链（`rusqlite` 的 bundled SQLite 需要 `cc`）。
 Windows 上可以用 MSVC Build Tools，或者 GNU 目标 + w64devkit
 （GNU 目标还需要 w64devkit 的 `dlltool.exe` 在 `PATH` 里）。
-当前主要针对 Windows（无边框窗口、圆角窗口区域、系统字体加载按 Windows 调优）。
+当前主要针对 Windows（无边框分层窗口、圆角 alpha、系统字体加载按 Windows 调优）。
 
 ```powershell
 cargo run            # 开发运行
@@ -101,7 +102,7 @@ cargo build --release
 ```
 src/
   main.rs      启动：时钟打点、后台线程（字体/色盘/数据库）、进入事件循环
-  platform.rs  winit 窗口壳 + Win32 FFI（去标题栏、圆角 region、DWM、GDI 呈现）+ 重绘调度
+  platform.rs  winit 窗口壳 + Win32 FFI（去标题栏、分层窗口呈现、DWM、圆角 alpha）+ 重绘调度
   gfx.rs       CPU 三角光栅器：egui 图元 → BGRA 画布（实色/渐变/纹理三条内核）
   trace.rs     启动打点（缓冲后一次性输出）
   app.rs       应用状态：绘制、交互、持久化、toast、Command 队列

@@ -78,11 +78,12 @@ fn mul255(a: u32, b: u32) -> u32 {
 
 /// Source-over blending for premultiplied 8-bit colours.
 #[inline(always)]
-fn over(dst: u32, r: u32, g: u32, b: u32, inv: u32) -> u32 {
+fn over(dst: u32, r: u32, g: u32, b: u32, a: u32, inv: u32) -> u32 {
     let dr = r + mul255((dst >> 16) & 0xFF, inv);
     let dg = g + mul255((dst >> 8) & 0xFF, inv);
     let db = b + mul255(dst & 0xFF, inv);
-    0xFF00_0000 | (dr.min(255) << 16) | (dg.min(255) << 8) | db.min(255)
+    let da = a + mul255(dst >> 24, inv);
+    (da.min(255) << 24) | (dr.min(255) << 16) | (dg.min(255) << 8) | db.min(255)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -211,7 +212,7 @@ impl Canvas {
 
     /// Fill the whole surface with an opaque colour.
     pub fn clear(&mut self, color: Color32) {
-        let value = pack(color.r(), color.g(), color.b(), 255);
+        let value = pack(color.r(), color.g(), color.b(), color.a());
         self.pixels.fill(value);
         self.filled = 0;
     }
@@ -555,7 +556,7 @@ impl Canvas {
                         self.px_solid_over += length as u64;
                         let inv = 255 - *a;
                         for pixel in slice.iter_mut() {
-                            *pixel = over(*pixel, *r, *g, *b, inv);
+                            *pixel = over(*pixel, *r, *g, *b, *a, inv);
                         }
                     }
                 }
@@ -586,7 +587,7 @@ impl Canvas {
                         } else {
                             let inv = 255 - sa;
                             for pixel in slice.iter_mut() {
-                                *pixel = over(*pixel, r, g, b, inv);
+                                *pixel = over(*pixel, r, g, b, sa, inv);
                             }
                         }
                         continue;
@@ -610,6 +611,7 @@ impl Canvas {
                                     (at[0].clamp(0.0, a) + 0.5).min(255.0) as u32,
                                     (at[1].clamp(0.0, a) + 0.5).min(255.0) as u32,
                                     (at[2].clamp(0.0, a) + 0.5).min(255.0) as u32,
+                                    sa,
                                     inv,
                                 );
                             }
@@ -699,7 +701,7 @@ impl Canvas {
                                 *pixel = pack(src[0] as u8, src[1] as u8, src[2] as u8, 255);
                             } else {
                                 let inv = 255 - a;
-                                *pixel = over(*pixel, src[0], src[1], src[2], inv);
+                                *pixel = over(*pixel, src[0], src[1], src[2], a, inv);
                             }
                         }
                         fx += step_x;
@@ -780,10 +782,11 @@ fn blend_packed(pixel: &mut Texel, src: Texel) {
     let r = ((src >> 16) & 0xFF) + (((d >> 16) & 0xFF) * inv + 128 >> 8);
     let g = ((src >> 8) & 0xFF) + (((d >> 8) & 0xFF) * inv + 128 >> 8);
     let b = (src & 0xFF) + ((d & 0xFF) * inv + 128 >> 8);
+    let out_a = a + ((d >> 24) * inv + 128 >> 8);
     let r = r.min(255);
     let g = g.min(255);
     let b = b.min(255);
-    *pixel = (255 << 24) | (r << 16) | (g << 8) | b;
+    *pixel = (out_a.min(255) << 24) | (r << 16) | (g << 8) | b;
 }
 
 #[inline(always)]

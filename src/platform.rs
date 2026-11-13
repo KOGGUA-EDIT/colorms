@@ -20,7 +20,6 @@ use crate::color::PickerColor;
 use crate::db::Db;
 use crate::gfx::Canvas;
 use crate::trace;
-use crate::ui;
 
 /// Everything `main` prepared before the window exists.
 pub struct Boot {
@@ -94,7 +93,9 @@ const ICON_BYTES: &[u8] = include_bytes!("../assets/icon_256.rgba");
 const ICON_SIZE: u32 = 256;
 const MIN_SIZE: [f64; 2] = [520.0, 580.0];
 const DEFAULT_SIZE: [f32; 2] = [640.0, 720.0];
-const BACKDROP: Color32 = Color32::from_rgb(32, 32, 32);
+/// Transparent so the corners outside the rounded chassis keep their
+/// anti-aliased fringe when the compositor blends the window onto the desktop.
+const BACKDROP: Color32 = Color32::TRANSPARENT;
 
 pub fn run(boot: Boot) -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
@@ -112,7 +113,6 @@ struct Host {
     app: Option<ColormsApp>,
     canvas: Canvas,
     surface: Option<Surface>,
-    region_key: (u32, u32, i32, bool),
     next_repaint: Option<Instant>,
     shown: bool,
     icon_set: bool,
@@ -130,7 +130,6 @@ impl Host {
             app: None,
             canvas: Canvas::new(),
             surface: None,
-            region_key: (0, 0, -1, false),
             next_repaint: None,
             shown: false,
             icon_set: false,
@@ -214,35 +213,6 @@ impl Host {
         self.state = Some(state);
         self.app = Some(app);
         self.canvas = canvas;
-        self.apply_region();
-    }
-
-    fn apply_region(&mut self) {
-        let (Some(window), Some(_)) = (self.window.as_ref(), self.surface.as_ref()) else {
-            return;
-        };
-        let size = window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-        let scale = window.scale_factor();
-        let maximized = window.is_maximized();
-        let radius = if maximized {
-            0
-        } else {
-            (ui::WINDOW_RADIUS as f64 * scale).round() as i32
-        };
-        let key = (
-            size.width,
-            size.height,
-            if maximized { -1 } else { radius },
-            maximized,
-        );
-        if self.region_key == key {
-            return;
-        }
-        self.region_key = key;
-        Foreground::apply_region(window_handle(window), size.width, size.height, radius);
     }
 
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
@@ -303,6 +273,15 @@ impl Host {
         if !self.shown {
             window.set_visible(true);
             self.shown = true;
+            // winit re-applies its own frame style when the window is first
+            // shown, so strip it and re-assert the layered surface before the
+            // frame is presented again below.
+            if Foreground::after_show(window_handle(window)) {
+                eprintln!("restored the layered window style");
+            }
+            // winit shows the window with SW_SHOWNOACTIVATE, so a freshly
+            // launched Colorms would sit behind whatever the user was using.
+            Foreground::raise(window_handle(window));
             trace::mark("startup: first frame visible");
         }
         let show = t_show.elapsed();
@@ -316,6 +295,11 @@ impl Host {
             icon_took = t_icon.elapsed();
             self.icon_set = true;
             trace::mark("startup: window icon installed");
+            // Removing the native frame re-created the redirection surface, so
+            // present once more to be sure the pixels are on screen.
+            if !surface.present(size.width, size.height, self.canvas.pixels()) {
+                eprintln!("could not present the Colorms frame");
+            }
         }
         self.frames += 1;
         if self.shown {
@@ -428,7 +412,6 @@ impl ApplicationHandler for Host {
                 event_loop.exit();
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                self.apply_region();
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
                 }
@@ -595,15 +578,51 @@ impl Surface {
         }
         unsafe {
             std::ptr::copy_nonoverlapping(pixels.as_ptr(), self.bits as *mut u32, count);
-            let window_dc = GetDC(self.hwnd);
-            if window_dc == 0 {
+            // A layered window is composited straight from this DIB, alpha
+            // included, so the anti-aliased corners survive instead of being
+            // cut out by a window region.
+            Foreground::set_layered(self.hwnd);
+            // The window's size and position belong to winit: passing them to
+            // `UpdateLayeredWindow` would resize the window as a side effect,
+            // so it would fight the user's drag (the window kept snapping back
+            // to the previous size, which looked like violent flicker). Skipping
+            // the frame whenever the two disagree keeps the window in charge:
+            // the next redraw runs at the window's own size.
+            let mut window_rect = LayerRect::default();
+            GetWindowRect(self.hwnd, &mut window_rect);
+            if window_rect.right - window_rect.left != w
+                || window_rect.bottom - window_rect.top != h
+            {
+                // Not a failure: the window is mid-resize, so the next frame
+                // will be drawn (and presented) at its new size.
+                return true;
+            }
+            let destination = LayerPoint {
+                x: window_rect.left,
+                y: window_rect.top,
+            };
+            let size = LayerSize { cx: w, cy: h };
+            let source = LayerPoint { x: 0, y: 0 };
+            let blend = BlendFunction {
+                operation: AC_SRC_OVER,
+                flags: 0,
+                alpha: 255,
+                format: AC_SRC_ALPHA,
+            };
+            let drawn = UpdateLayeredWindow(
+                self.hwnd,
+                0,
+                &destination,
+                &size,
+                self.memory_dc,
+                &source,
+                0,
+                &blend,
+                ULW_ALPHA,
+            );
+            if drawn == 0 {
                 return false;
             }
-            // GDI blits straight into the DWM redirection surface, so the
-            // compositor does the actual presentation (and there is no tearing).
-            BitBlt(window_dc, 0, 0, w, h, self.memory_dc, 0, 0, SRCCOPY);
-            ReleaseDC(self.hwnd, window_dc);
-            ValidateRect(self.hwnd, std::ptr::null());
         }
         true
     }
@@ -657,9 +676,42 @@ struct BitmapInfo {
     bmiColors: [RgbQuad; 1],
 }
 
+#[repr(C)]
+struct LayerPoint {
+    x: i32,
+    y: i32,
+}
+
+#[repr(C)]
+struct LayerSize {
+    cx: i32,
+    cy: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LayerRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[repr(C, packed)]
+struct BlendFunction {
+    operation: u8,
+    flags: u8,
+    alpha: u8,
+    format: u8,
+}
+
 const BI_RGB: u32 = 0;
 const DIB_RGB_COLORS: u32 = 0;
-const SRCCOPY: u32 = 0x00CC_0020;
+const GWL_EXSTYLE: i32 = -20;
+const WS_EX_LAYERED: isize = 0x0008_0000;
+const ULW_ALPHA: u32 = 2;
+const AC_SRC_OVER: u8 = 0;
+const AC_SRC_ALPHA: u8 = 1;
 const WS_CAPTION: u32 = 0x00C0_0000;
 const WS_SYSMENU: u32 = 0x0008_0000;
 const WS_MINIMIZEBOX: u32 = 0x0002_0000;
@@ -674,9 +726,21 @@ const SWP_NOACTIVATE: u32 = 0x0010;
 
 #[link(name = "user32")]
 unsafe extern "system" {
+    fn GetWindowRect(hwnd: isize, rect: *mut LayerRect) -> i32;
+    fn UpdateLayeredWindow(
+        hwnd: isize,
+        dst: Hdc,
+        dst_point: *const LayerPoint,
+        size: *const LayerSize,
+        src: Hdc,
+        src_point: *const LayerPoint,
+        key: u32,
+        blend: *const BlendFunction,
+        flags: u32,
+    ) -> i32;
+    fn SetForegroundWindow(hwnd: isize) -> i32;
     fn GetDC(hwnd: isize) -> Hdc;
     fn ReleaseDC(hwnd: isize, hdc: Hdc) -> i32;
-    fn ValidateRect(hwnd: isize, rect: *const std::ffi::c_void) -> i32;
     fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
     fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
     fn SetClassLongPtrW(hwnd: isize, index: i32, value: isize) -> usize;
@@ -689,7 +753,6 @@ unsafe extern "system" {
         height: i32,
         flags: u32,
     ) -> i32;
-    fn SetWindowRgn(hwnd: isize, region: isize, redraw: i32) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -706,18 +769,6 @@ unsafe extern "system" {
     ) -> isize;
     fn SelectObject(hdc: Hdc, object: isize) -> isize;
     fn DeleteObject(object: isize) -> i32;
-    fn BitBlt(
-        dst: Hdc,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-        src: Hdc,
-        src_x: i32,
-        src_y: i32,
-        rop: u32,
-    ) -> i32;
-    fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
     fn CreateSolidBrush(color: u32) -> isize;
 }
 
@@ -769,30 +820,96 @@ impl Foreground {
             // window animation that would otherwise sit between `ShowWindow`
             // and the first visible frame.
             DwmSetWindowAttribute(hwnd, 3, value, 4);
+            // The frame is drawn by egui with its own anti-aliased rounding, so
+            // the compositor must not round the window a second time.
+            let corners: u32 = 1; // DWMWCP_DONOTROUND
+            DwmSetWindowAttribute(
+                hwnd,
+                33,
+                &corners as *const u32 as *const std::ffi::c_void,
+                4,
+            );
+            // The window is a layered surface: `UpdateLayeredWindow` delivers
+            // premultiplied BGRA per pixel, which is what keeps the rounded
+            // corners smooth (a window region can only cut whole pixels).
+            Self::set_layered(hwnd);
         }
     }
 
-    fn apply_region(hwnd: isize, width: u32, height: u32, radius: i32) {
+    /// Raise the window without touching its style (winit's own focus helpers
+    /// re-apply the cached window flags, which drops the layered surface).
+    fn raise(hwnd: isize) {
         if hwnd == 0 {
             return;
         }
         unsafe {
-            if radius <= 0 {
-                SetWindowRgn(hwnd, 0, 1);
+            SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            SetForegroundWindow(hwnd);
+        }
+    }
+
+    fn set_layered(hwnd: isize) {
+        unsafe {
+            let extended = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if extended & WS_EX_LAYERED != 0 {
                 return;
             }
-            let region = CreateRoundRectRgn(
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, extended | WS_EX_LAYERED);
+            SetWindowPos(
+                hwnd,
                 0,
                 0,
-                width as i32 + 1,
-                height as i32 + 1,
-                radius * 2,
-                radius * 2,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            if region != 0 {
-                // The system owns the region after a successful call.
-                SetWindowRgn(hwnd, region, 1);
+        }
+    }
+
+    /// `ShowWindow` and `SetWindowLongW` re-apply winit's cached window style,
+    /// which brings back `WS_CAPTION`/`WS_THICKFRAME` (a 1 px native frame that
+    /// makes a rounded window still read as square) and drops `WS_EX_LAYERED`
+    /// (leaving nothing to composite). Undo both and report whether the
+    /// layered style had to be restored.
+    fn after_show(hwnd: isize) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+            let stripped = style & !(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+            if stripped != style {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, stripped as isize);
+                SetWindowPos(
+                    hwnd,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
             }
+            let corners: u32 = 1; // DWMWCP_DONOTROUND
+            DwmSetWindowAttribute(
+                hwnd,
+                33,
+                &corners as *const u32 as *const std::ffi::c_void,
+                4,
+            );
+            let extended = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let restored = extended & WS_EX_LAYERED == 0;
+            Self::set_layered(hwnd);
+            restored
         }
     }
 }

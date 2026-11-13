@@ -486,12 +486,20 @@ pub fn paint_background(
 
     if layout.content.height() > 1.0 {
         // Two-stop vertical gradient from the color-tinted surface down to the
-        // exact footer colour. Keeping the top edge below the rounded corners
-        // means the transparent window corners stay clean.
+        // exact footer colour. The gradient stops one corner radius above the
+        // bottom edge: it is a plain quad, so anything it covers becomes opaque
+        // and would square off the rounded corners below it. Its last stop is
+        // the chassis colour there, so the hand-over is invisible.
         let mut mesh = egui::Mesh::default();
         let top = theme.surface_top;
         let bottom = theme.surface_bottom;
-        let rect = layout.content;
+        let rect = Rect::from_min_max(
+            layout.content.min,
+            egui::pos2(
+                layout.content.max.x,
+                (layout.content.max.y - radius as f32).max(layout.content.min.y),
+            ),
+        );
         let base = mesh.vertices.len() as u32;
         mesh.vertices.push(egui::epaint::Vertex {
             pos: rect.left_top(),
@@ -562,8 +570,14 @@ pub fn paint_ambient_glow(
     layout: &Layout,
     metrics: &Metrics,
     glow: egui::TextureId,
+    radius: u8,
 ) {
-    let painter = painter.with_clip_rect(layout.content.intersect(layout.full));
+    // The bloom is translucent, but painting it over the transparent window
+    // corners would still make them partly opaque; stop it at the same line as
+    // the surface gradient.
+    let mut clip = layout.content.intersect(layout.full);
+    clip.max.y = (clip.max.y - radius as f32).max(clip.min.y);
+    let painter = painter.with_clip_rect(clip);
     let half = metrics.wheel_radius * 1.55;
     let rect = Rect::from_center_size(metrics.wheel_center, Vec2::splat(half * 2.0));
     painter.image(

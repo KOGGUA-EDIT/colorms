@@ -348,7 +348,7 @@ impl ColormsApp {
 
         ui::paint_background(&painter, &layout, &theme, radius);
         let glow = self.glow_texture(ctx, theme.accent);
-        ui::paint_ambient_glow(&painter, &layout, &metrics, glow);
+        ui::paint_ambient_glow(&painter, &layout, &metrics, glow, radius);
         ui::titlebar_hairline(&painter, layout.title);
 
         self.draw_wheel(ctx, ui, &layout, &metrics, &theme);

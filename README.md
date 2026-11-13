@@ -1,7 +1,10 @@
-# Colorms
+# Colorms 2.0
 
 用 Rust + egui 做的 Material You 风格颜色制作器。界面按照 `ui.vectorcraft`
 （576 × 576 画板）1:1 还原并随窗口等比缩放。
+
+2.0 把窗口壳和渲染整个换掉了：不再用 eframe / OpenGL，改成自研 CPU 光栅器
++ Windows 分层窗口，冷启动从 ~344 ms 降到 ~65 ms（约 5.2×），详见[性能](#性能)。
 
 ![Colorms](docs/screenshot.png)
 
@@ -31,14 +34,14 @@
 ## 性能
 
 冷启动按“进程启动 → 首帧可见”优化。同一台机器、同一套外部计时脚本
-（枚举窗口直到可见且尺寸正确）交替跑 8 轮：
+（枚举窗口直到可见且尺寸正确）交替跑 6 轮：
 
 | 版本 | 中位数 | 范围 |
 | --- | --- | --- |
-| 旧版（eframe / OpenGL） | 344 ms | 330–351 ms |
-| 当前版本（CPU 光栅 + 分层窗口） | **65 ms** | 64–82 ms |
+| 1.0（eframe / OpenGL） | 337 ms | 328–396 ms |
+| 2.0（CPU 光栅 + 分层窗口） | **65 ms** | 62–67 ms |
 
-约 **5.3×** 的提升，主要来自不再初始化 GPU 驱动：
+约 **5.2×** 的提升，主要来自不再初始化 GPU 驱动：
 
 - 不链接 `eframe` / `glutin` / `egui_glow`，改用 `winit` + `egui-winit` 自建窗口壳，
   跳过 `ChoosePixelFormat` + `wglMakeCurrent`（本机约 210 ms 的 GL ICD 初始化）。
@@ -108,7 +111,7 @@ src/
   ui.rs        布局/度量、色盘/明度/光晕纹理、图标与背景绘制
   color.rs     色彩模型（HSV / hex / 对比度 / Material 色）
   theme.rs     动态 Material You 暗色主题
-  db.rs        SQLite（WAL）、最近颜色、设置
+  db.rs        SQLite（WAL）、上次颜色与窗口尺寸
 benches/
   color.rs     criterion 基准
 assets/        窗口图标原始 RGBA

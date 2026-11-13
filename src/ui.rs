@@ -12,7 +12,9 @@ use egui::{
 /// Side of the original artboard, in vector units.
 pub const BOARD: f32 = 576.0;
 pub const TITLE_H: f32 = 46.0;
-pub const FOOTER_H: f32 = 54.0;
+/// The recent-colour strip was removed, so the artboard now runs to the
+/// bottom edge; the field stays for the toast, which hangs above it.
+pub const FOOTER_H: f32 = 0.0;
 pub const WINDOW_RADIUS: u8 = 20;
 pub const RESIZE_GRAB: f32 = 6.0;
 
@@ -404,7 +406,7 @@ pub fn paint_window_border(
         painter.rect_filled(full.shrink(0.5), CornerRadius::ZERO, color);
         return;
     }
-    let thick = 1.0;
+    let thick = 2.0;
     let (left, top, right, bottom) = (full.left(), full.top(), full.right(), full.bottom());
     painter.rect_filled(
         Rect::from_min_max(pos2(left + radius, top), pos2(right - radius, top + thick)),

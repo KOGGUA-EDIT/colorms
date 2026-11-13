@@ -18,7 +18,7 @@ use egui::{
 };
 
 use crate::color::PickerColor;
-use crate::db::{Db, RECENT_LIMIT, StoredColor};
+use crate::db::Db;
 use crate::theme::{self, Theme};
 use crate::trace;
 use crate::ui::{self, FONT_DISPLAY, FONT_MONO, Layout, Metrics};
@@ -120,7 +120,6 @@ impl StartupAssets {
 pub struct ColormsApp {
     color: PickerColor,
     db: Db,
-    recent: Vec<StoredColor>,
     toast: Option<Toast>,
     pending_toast: Option<(String, f32)>,
 
@@ -181,19 +180,9 @@ impl ColormsApp {
         );
         trace::mark("startup: slider+brand textures");
 
-        let recent = match db.recent_colors(RECENT_LIMIT) {
-            Ok(colors) => colors,
-            Err(err) => {
-                eprintln!("could not load recent colours: {err}");
-                Vec::new()
-            }
-        };
-        trace::mark("startup: recent colours");
-
         let mut app = Self {
             color: initial_color.clamped(),
             db,
-            recent,
             toast: None,
             pending_toast: None,
             wheel,
@@ -230,21 +219,14 @@ impl ColormsApp {
         }
     }
 
-    /// Persist the selected colour and refresh the footer. Returns false when
-    /// the database write failed (the caller can surface that to the user).
+    /// Persist the selected colour. Returns false when the database write
+    /// failed (the caller can surface that to the user).
     fn commit(&mut self, now: f64) -> bool {
-        let hex = self.color.hex();
         let mut ok = true;
-        match self.db.save_color(self.color) {
-            Ok(()) => self.refresh_recent(),
-            Err(err) => {
-                ok = false;
-                eprintln!("failed to save colour {hex}: {err}");
-                self.show_toast("保存失败：数据库不可写".to_owned(), now);
-            }
-        }
         if let Err(err) = self.db.save_last_color(self.color) {
-            eprintln!("failed to save last colour: {err}");
+            ok = false;
+            eprintln!("failed to save colour: {err}");
+            self.show_toast("保存失败：数据库不可写".to_owned(), now);
         }
         self.dirty = false;
         self.touched = true;
@@ -253,23 +235,10 @@ impl ColormsApp {
 
     pub fn persist_now(&mut self) {
         let _ = self.db.save_last_color(self.color);
-        if self.dirty || self.touched {
-            if let Err(err) = self.db.save_color(self.color) {
-                eprintln!("failed to save colour on exit: {err}");
-            }
-            self.dirty = false;
-            self.refresh_recent();
-        }
+        self.dirty = false;
         if self.last_size.x > 1.0 && self.last_size.y > 1.0 {
             let _ = self.db.save_window_size(self.last_size.x, self.last_size.y);
             self.persisted_size = self.last_size;
-        }
-    }
-
-    fn refresh_recent(&mut self) {
-        match self.db.recent_colors(RECENT_LIMIT) {
-            Ok(colors) => self.recent = colors,
-            Err(err) => eprintln!("could not refresh recent colours: {err}"),
         }
     }
 
@@ -308,7 +277,7 @@ impl ColormsApp {
         let side = radius.ceil().max(1.0) + 2.0;
         let key = side as u32;
         if self.border_corner.is_none() || self.border_side != key {
-            let image = ui::corner_ring_image(side as usize, radius, 1.0);
+            let image = ui::corner_ring_image(side as usize, radius, 2.0);
             match &mut self.border_corner {
                 Some(handle) => handle.set(image, egui::TextureOptions::LINEAR),
                 None => {
@@ -368,7 +337,6 @@ impl ColormsApp {
         self.draw_preview(&painter, &metrics);
         self.draw_hex_pill(ctx, ui, &layout, &metrics, &theme, now);
         self.draw_copy_card(ctx, ui, &layout, &metrics, &theme, now);
-        self.draw_footer(ctx, ui, &layout, now);
         self.draw_titlebar(ctx, ui, &layout, &theme, &painter, maximized);
         self.draw_toast(ctx, &painter, &layout, &theme, now);
         self.draw_resize_handles(ctx, ui, &layout, maximized);
@@ -601,86 +569,6 @@ impl ColormsApp {
         );
         ui::fill_round_rect(painter, metrics.copy_back, metrics.copy_radius, back);
         ui::fill_round_rect(painter, metrics.copy_front, metrics.copy_radius, front);
-    }
-
-    fn draw_footer(&mut self, ctx: &egui::Context, ui: &Ui, layout: &Layout, now: f64) {
-        let footer = layout.footer;
-        if footer.height() < 8.0 {
-            return;
-        }
-        let painter = ui.painter();
-        let center_y = footer.center().y;
-        let dots_left = footer.left() + 24.0;
-        let right_limit = footer.right() - 20.0;
-
-        if self.recent.is_empty() {
-            return;
-        }
-
-        let radius = 7.5;
-        let gap = 9.0;
-        let step = radius * 2.0 + gap;
-        let max_dots = (((right_limit - dots_left + gap) / step).floor().max(0.0) as usize).min(12);
-        let count = self.recent.len().min(max_dots);
-        if count == 0 {
-            return;
-        }
-
-        let current_hex = self.color.hex();
-        let snapshot = self.recent.clone();
-        let mut removed: Option<String> = None;
-
-        for (index, stored) in snapshot.iter().take(count).enumerate() {
-            let center = pos2(dots_left + radius + index as f32 * step, center_y);
-            let hit = Rect::from_center_size(center, Vec2::splat(radius * 2.0 + 6.0));
-            let response = ui.interact(hit, Id::new(("colorms-recent", index)), Sense::click());
-            if response.hovered() {
-                ctx.set_cursor_icon(CursorIcon::PointingHand);
-            }
-            let hover = ctx.animate_bool_with_time(
-                Id::new(("colorms-recent-hover", index)),
-                response.hovered(),
-                0.10,
-            );
-            if response.clicked() {
-                self.color = stored.color.clamped();
-                self.dirty = true;
-                self.touched = true;
-            }
-            if response.secondary_clicked() {
-                removed = Some(stored.hex.clone());
-            }
-
-            let dot_radius = radius + hover * 1.2;
-            let selected = stored.hex.eq_ignore_ascii_case(&current_hex);
-            painter.circle_filled(
-                center + vec2(0.0, 0.8),
-                dot_radius,
-                Color32::from_black_alpha(90),
-            );
-            painter.circle_filled(center, dot_radius, theme::color32(stored.color.rgb()));
-            if selected {
-                painter.circle_stroke(
-                    center,
-                    dot_radius + 3.0,
-                    Stroke::new(1.8_f32, Color32::WHITE),
-                );
-            }
-        }
-
-        if let Some(hex) = removed {
-            match self.db.delete_color(&hex) {
-                Ok(_) => {
-                    self.refresh_recent();
-                    self.show_toast(format!("已移除 {hex}"), now);
-                    ctx.request_repaint();
-                }
-                Err(err) => {
-                    eprintln!("failed to delete {hex}: {err}");
-                    self.show_toast("删除失败：数据库不可写".to_owned(), now);
-                }
-            }
-        }
     }
 
     fn draw_titlebar(

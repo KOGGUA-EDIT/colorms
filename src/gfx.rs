@@ -503,6 +503,22 @@ impl Canvas {
             Shade::Gradient(c0, c1, c2)
         };
 
+        // An opaque fill can be painted onto every pixel a sub-pixel sliver
+        // touches: overlapping the same colour changes nothing, so a sliver
+        // that the centre rule would have missed no longer leaves a hole.
+        let opaque_solid = matches!(&shade, Shade::Solid { a, .. } if *a >= 255);
+        let (y_start, y_end) = if opaque_solid && bottom - top < 1.0 {
+            (
+                (top.floor() as i32).max(clip.y0),
+                ((bottom.ceil() as i32) - 1).min(clip.y1 - 1),
+            )
+        } else {
+            (y_start, y_end)
+        };
+        if y_start > y_end {
+            return;
+        }
+
         // Plane equations for the interpolated attributes: q(p) = q0 + A * dx + B * dy.
         let (c0, c1, c2) = (
             [
@@ -579,7 +595,12 @@ impl Canvas {
                 continue;
             }
             let thin = (x_right - x_left) < 1.0;
-            let (xs, xe) = if thin {
+            let (xs, xe) = if thin && opaque_solid {
+                (
+                    (x_left.floor() as i32).max(clip.x0),
+                    ((x_right.ceil() as i32) - 1).min(clip.x1 - 1),
+                )
+            } else if thin {
                 let centre = ((x_left + x_right) * 0.5).floor() as i32;
                 let x = centre.clamp(clip.x0, clip.x1 - 1);
                 (x, x)

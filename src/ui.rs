@@ -208,6 +208,60 @@ pub fn corner_radius(radius: f32) -> CornerRadius {
     CornerRadius::same(radius.round().clamp(0.0, 255.0) as u8)
 }
 
+/// Opaque rounded rectangle built from plain rects and circles.
+///
+/// `rect_filled` with a corner radius tessellates the caps as triangle fans
+/// whose slivers are narrower than a pixel at the rim; the CPU rasterizer
+/// cannot tile those exactly, which left a torn wedge in the hex pill's right
+/// cap. Two overlapping rects plus four corner discs cover the same area with
+/// shapes it does rasterize exactly, and because the fill is opaque the
+/// overlaps are invisible.
+pub fn fill_round_rect(painter: &Painter, rect: Rect, radius: f32, color: Color32) {
+    let radius = radius
+        .min(rect.width() * 0.5)
+        .min(rect.height() * 0.5)
+        .max(0.0);
+    if radius < 0.5 {
+        painter.rect_filled(rect, CornerRadius::ZERO, color);
+        return;
+    }
+    // Corners first: the rects below are axis-aligned and fully opaque, so they
+    // cover the inner half of each disc's anti-aliased fringe and every fringe
+    // pixel is blended exactly once. Coincident discs (a pill, where the radius
+    // is half the height) are drawn once, otherwise their fringes would blend
+    // twice and leave a dotted ring inside the cap.
+    let mut corners: Vec<Pos2> = Vec::with_capacity(4);
+    for corner in [
+        pos2(rect.left() + radius, rect.top() + radius),
+        pos2(rect.right() - radius, rect.top() + radius),
+        pos2(rect.left() + radius, rect.bottom() - radius),
+        pos2(rect.right() - radius, rect.bottom() - radius),
+    ] {
+        if corners.iter().all(|other| other.distance(corner) > 0.01) {
+            corners.push(corner);
+        }
+    }
+    for corner in corners {
+        painter.circle_filled(corner, radius, color);
+    }
+    painter.rect_filled(
+        Rect::from_min_max(
+            pos2(rect.left(), rect.top() + radius),
+            pos2(rect.right(), rect.bottom() - radius),
+        ),
+        CornerRadius::ZERO,
+        color,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(
+            pos2(rect.left() + radius, rect.top()),
+            pos2(rect.right() - radius, rect.bottom()),
+        ),
+        CornerRadius::ZERO,
+        color,
+    );
+}
+
 pub fn font_display(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(FONT_DISPLAY.into()))
 }
@@ -306,13 +360,74 @@ pub fn footer_hairline(painter: &Painter, rect: Rect) {
     );
 }
 
+/// One-pixel ring around the window chassis.
+///
+/// A `rect_stroke` tessellates the corners into slivers narrower than a pixel;
+/// the CPU rasterizer cannot tile those exactly, so the arc came out dotted.
+/// The ring is therefore composed from axis-aligned 1 px strips plus a chain of
+/// small opaque squares stamped along each corner arc. Consecutive stamps
+/// overlap, and an overlap of the same opaque colour is invisible, so the arc
+/// is continuous no matter where the pixel grid falls.
 pub fn paint_window_border(painter: &Painter, full: Rect, color: Color32, radius: u8) {
-    painter.rect_stroke(
-        full.shrink(0.5),
-        CornerRadius::same(radius),
-        Stroke::new(1.0_f32, color),
-        StrokeKind::Inside,
+    let radius = (radius as f32)
+        .min(full.width() * 0.5)
+        .min(full.height() * 0.5);
+    let thick = 1.0;
+    if radius < 1.0 {
+        painter.rect_filled(full.shrink(0.5), CornerRadius::ZERO, color);
+        return;
+    }
+    let arc = radius - thick * 0.5;
+    painter.rect_filled(
+        Rect::from_min_max(full.left_top(), pos2(full.right(), full.top() + thick)),
+        CornerRadius::ZERO,
+        color,
     );
+    painter.rect_filled(
+        Rect::from_min_max(
+            pos2(full.left(), full.bottom() - thick),
+            full.right_bottom(),
+        ),
+        CornerRadius::ZERO,
+        color,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(full.left_top(), pos2(full.left() + thick, full.bottom())),
+        CornerRadius::ZERO,
+        color,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(pos2(full.right() - thick, full.top()), full.right_bottom()),
+        CornerRadius::ZERO,
+        color,
+    );
+    let stamp = Vec2::splat(1.4);
+    for (centre, start) in [
+        (
+            pos2(full.left() + arc, full.top() + arc),
+            std::f32::consts::PI,
+        ),
+        (
+            pos2(full.right() - arc, full.top() + arc),
+            std::f32::consts::FRAC_PI_2 * 3.0,
+        ),
+        (
+            pos2(full.left() + arc, full.bottom() - arc),
+            std::f32::consts::FRAC_PI_2,
+        ),
+        (pos2(full.right() - arc, full.bottom() - arc), 0.0),
+    ] {
+        let steps = ((arc * 2.0) as i32).max(6);
+        for step in 0..=steps {
+            let angle = start + std::f32::consts::FRAC_PI_2 * step as f32 / steps as f32;
+            let point = pos2(centre.x + angle.cos() * arc, centre.y + angle.sin() * arc);
+            painter.rect_filled(
+                Rect::from_center_size(point, stamp),
+                CornerRadius::ZERO,
+                color,
+            );
+        }
+    }
 }
 
 /// The full-window rounded chassis plus the adaptive content gradient.
@@ -324,6 +439,10 @@ pub fn paint_background(
 ) {
     let full = layout.full;
     let corner = CornerRadius::same(radius);
+    // The 1 px outline is painted on top of the finished frame by
+    // `paint_window_border`: a ring built from fills leaves the rim to the
+    // outer shape's sub-pixel corner slivers, which the rasterizer cannot tile
+    // without gaps.
     painter.rect_filled(full, corner, theme.footer);
 
     if layout.content.height() > 1.0 {

@@ -499,14 +499,19 @@ impl ColormsApp {
             self.copy_current(ctx, now);
         }
         let painter = ui.painter();
-        let radius = ui::corner_radius(metrics.pill_radius);
         // The pill stays visible through its fill alone: the design's outlines
         // were dropped so the control area reads as flat Material surfaces.
-        painter.rect_filled(
-            rect,
-            radius,
+        // The layer is flattened onto the backdrop and drawn opaque because the
+        // rounded caps are composed from rects and discs, whose overlaps would
+        // otherwise blend twice.
+        let fill = over_backdrop(
+            layout,
+            metrics,
+            theme,
+            rect.center(),
             theme::lerp_color(theme.surface, theme.surface_hover, hover),
         );
+        ui::fill_round_rect(painter, rect, metrics.pill_radius, fill);
         let font_size = (16.0 * layout.scale).clamp(13.0, 23.0);
         let font = ui::font_mono(font_size);
         // Optical centring: the text layout box includes descender space, so
@@ -544,7 +549,6 @@ impl ColormsApp {
         }
 
         let painter = ui.painter();
-        let radius = ui::corner_radius(metrics.copy_radius);
         let hex = self.color.hex();
         let copied = self.copied_hex.as_deref() == Some(hex.as_str());
         let copied = ctx.animate_bool_with_time(Id::new("colorms-copy-filled"), copied, 0.18);
@@ -570,8 +574,8 @@ impl ColormsApp {
             metrics.copy_back.center(),
             back_layer,
         );
-        painter.rect_filled(metrics.copy_back, radius, back);
-        painter.rect_filled(metrics.copy_front, radius, front);
+        ui::fill_round_rect(painter, metrics.copy_back, metrics.copy_radius, back);
+        ui::fill_round_rect(painter, metrics.copy_front, metrics.copy_radius, front);
     }
 
     fn draw_footer(&mut self, ctx: &egui::Context, ui: &Ui, layout: &Layout, now: f64) {

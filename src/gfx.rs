@@ -413,8 +413,18 @@ impl Canvas {
 
         let top = pos[0][1].min(pos[1][1]).min(pos[2][1]);
         let bottom = pos[0][1].max(pos[1][1]).max(pos[2][1]);
-        let y_start = ((top - 0.5).ceil() as i32).max(clip.y0);
-        let y_end = ((bottom - 0.5).floor() as i32).min(clip.y1 - 1);
+        // Same story as the spans below, one axis up: a triangle shorter than a
+        // pixel can fall entirely between two row centres, and dropping it put
+        // gaps in the 1 px arcs (the window border went dotted at the corners).
+        let (y_start, y_end) = if bottom - top < 1.0 {
+            let y = (((top + bottom) * 0.5).floor() as i32).clamp(clip.y0, clip.y1 - 1);
+            (y, y)
+        } else {
+            (
+                ((top - 0.5).ceil() as i32).max(clip.y0),
+                ((bottom - 0.5).floor() as i32).min(clip.y1 - 1),
+            )
+        };
         if y_start > y_end {
             return;
         }
@@ -554,13 +564,15 @@ impl Canvas {
             if !(xmin <= xmax) {
                 continue;
             }
-            // Only the pixels whose centres the span covers used to be painted,
-            // so anything narrower than a pixel (the 1 px arc of a rounded
-            // corner is the worst case) vanished between samples and read as a
-            // dotted line. Spans wider than a pixel keep the old centre rule so
-            // abutting triangles still tile exactly; the thin ones are widened
-            // to every pixel they touch, with the edge alpha set to the covered
-            // fraction so the arc stays continuous instead of dotting.
+            // Painting only the pixels whose centres the span covers made
+            // anything narrower than a pixel (the 1 px arc of a rounded corner
+            // is the worst case) vanish between samples and read as a dotted
+            // line. Spans wider than a pixel keep that centre rule, so abutting
+            // triangles still tile exactly. A thinner span is snapped to the
+            // single pixel holding its centre at full alpha: splitting it into
+            // fractional coverages was worse, because several slivers of the
+            // same fan land on that pixel and their coverages compound instead
+            // of adding up, which ate a crescent out of the disc's edge.
             let x_left = xmin.max(clip.x0 as f32);
             let x_right = xmax.min(clip.x1 as f32);
             if !(x_right > x_left) {
@@ -568,10 +580,9 @@ impl Canvas {
             }
             let thin = (x_right - x_left) < 1.0;
             let (xs, xe) = if thin {
-                (
-                    (x_left.floor() as i32).max(clip.x0),
-                    ((x_right.ceil() as i32) - 1).min(clip.x1 - 1),
-                )
+                let centre = ((x_left + x_right) * 0.5).floor() as i32;
+                let x = centre.clamp(clip.x0, clip.x1 - 1);
+                (x, x)
             } else {
                 (
                     ((x_left - 0.5).ceil() as i32).max(clip.x0),
@@ -583,22 +594,12 @@ impl Canvas {
             }
             let row = y as usize * self.width as usize;
             let length = (xe - xs + 1) as usize;
-            let cov_first = if thin {
-                (xs as f32 + 1.0 - x_left).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            let cov_last = if thin {
-                (x_right - xe as f32).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            let full = length > 0 && cov_first >= 0.999 && cov_last >= 0.999;
-            let covered = if thin {
-                (x_right - x_left).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
+            // Both branches above land on whole pixels, so every span is fully
+            // covered here.
+            let cov_first = 1.0f32;
+            let cov_last = 1.0f32;
+            let full = length > 0;
+            let covered = 1.0f32;
             let cov_at = |index: usize| -> f32 {
                 if length == 1 {
                     covered

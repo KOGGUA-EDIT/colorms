@@ -395,30 +395,9 @@ impl ColormsApp {
             }
         }
 
-        let hover =
-            ctx.animate_bool_with_time(Id::new("colorms-wheel-hover"), response.hovered(), 0.18);
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         ui.painter()
             .image(self.wheel.id(), rect, uv, Color32::WHITE);
-
-        let rim = theme::lerp_color(theme.outline, theme.outline_strong, hover);
-        ui.painter()
-            .circle_stroke(center, radius, Stroke::new(1.0_f32, rim));
-        if hover > 0.01 {
-            ui.painter().circle_stroke(
-                center,
-                radius + 2.0,
-                Stroke::new(
-                    1.0_f32,
-                    Color32::from_rgba_unmultiplied(
-                        theme.accent.r(),
-                        theme.accent.g(),
-                        theme.accent.b(),
-                        (60.0 * hover) as u8,
-                    ),
-                ),
-            );
-        }
 
         let angle = self.color.hue.to_radians();
         let marker_center =
@@ -436,11 +415,6 @@ impl ColormsApp {
             marker_center,
             (marker_radius - ring).max(1.0),
             theme::color32(self.color.rgb()),
-        );
-        painter.circle_stroke(
-            marker_center,
-            marker_radius,
-            Stroke::new(1.0_f32, Color32::from_black_alpha(70)),
         );
     }
 
@@ -469,23 +443,9 @@ impl ColormsApp {
             }
         }
 
-        let hover = ctx.animate_bool_with_time(
-            Id::new("colorms-brightness-hover"),
-            response.hovered() || response.is_pointer_button_down_on(),
-            0.12,
-        );
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         let painter = ui.painter();
         painter.image(self.slider.id(), rect, uv, Color32::WHITE);
-        painter.rect_stroke(
-            rect,
-            ui::corner_radius(rect.width() * 0.5),
-            Stroke::new(
-                1.0_f32,
-                theme::lerp_color(theme.outline, theme.outline_strong, hover),
-            ),
-            StrokeKind::Inside,
-        );
 
         // A small knob on the wheel side of the capsule makes the current
         // brightness obvious at a glance and mirrors Material sliders.
@@ -517,16 +477,6 @@ impl ColormsApp {
             Color32::from_black_alpha(90),
         );
         painter.circle_filled(center, radius, theme::color32(self.color.rgb()));
-        painter.circle_stroke(
-            center,
-            radius,
-            Stroke::new(1.0_f32, Color32::from_white_alpha(55)),
-        );
-        painter.circle_stroke(
-            center,
-            radius + 1.0,
-            Stroke::new(1.0_f32, Color32::from_black_alpha(55)),
-        );
     }
 
     fn draw_hex_pill(
@@ -550,19 +500,12 @@ impl ColormsApp {
         }
         let painter = ui.painter();
         let radius = ui::corner_radius(metrics.pill_radius);
+        // The pill stays visible through its fill alone: the design's outlines
+        // were dropped so the control area reads as flat Material surfaces.
         painter.rect_filled(
             rect,
             radius,
             theme::lerp_color(theme.surface, theme.surface_hover, hover),
-        );
-        painter.rect_stroke(
-            rect,
-            radius,
-            Stroke::new(
-                1.0_f32,
-                theme::lerp_color(theme.outline, theme.outline_strong, hover),
-            ),
-            StrokeKind::Inside,
         );
         let font_size = (16.0 * layout.scale).clamp(13.0, 23.0);
         let font = ui::font_mono(font_size);
@@ -605,18 +548,30 @@ impl ColormsApp {
         let hex = self.color.hex();
         let copied = self.copied_hex.as_deref() == Some(hex.as_str());
         let copied = ctx.animate_bool_with_time(Id::new("colorms-copy-filled"), copied, 0.18);
-        let rest = theme::lerp_color(theme.text_muted, theme.text, 0.45 * hover);
-        let stroke_color = theme::lerp_color(rest, Color32::WHITE, copied);
-        let stroke = Stroke::new((1.35 * layout.scale).clamp(1.0, 2.6), stroke_color);
 
-        // Both sheets are outlines only. The front sheet is painted with the
-        // surface colour so it masks the back sheet where the two overlap;
-        // together they read as the single folded-corner copy glyph from the
-        // design. A successful copy turns the whole outline white.
-        painter.rect_stroke(metrics.copy_back, radius, stroke, StrokeKind::Inside);
-        let mask = gradient_color_at(layout, theme, metrics.copy_front.center().y);
-        painter.rect_filled(metrics.copy_front, radius, mask);
-        painter.rect_stroke(metrics.copy_front, radius, stroke, StrokeKind::Inside);
+        // Two flat sheets instead of two outlines: the back sheet is a darker
+        // surface, the front one sits on top and masks it where they overlap,
+        // so the pair still reads as the folded-corner copy glyph. A successful
+        // copy lifts the front sheet to white instead of recolouring a stroke.
+        let front_layer = theme::lerp_color(theme.surface_hover, theme.surface_pressed, hover);
+        let front_layer = theme::lerp_color(front_layer, Color32::from_white_alpha(190), copied);
+        let back_layer = theme::lerp_color(theme.surface, theme.surface_hover, hover);
+        let front = over_backdrop(
+            layout,
+            metrics,
+            theme,
+            metrics.copy_front.center(),
+            front_layer,
+        );
+        let back = over_backdrop(
+            layout,
+            metrics,
+            theme,
+            metrics.copy_back.center(),
+            back_layer,
+        );
+        painter.rect_filled(metrics.copy_back, radius, back);
+        painter.rect_filled(metrics.copy_front, radius, front);
     }
 
     fn draw_footer(&mut self, ctx: &egui::Context, ui: &Ui, layout: &Layout, now: f64) {
@@ -675,18 +630,6 @@ impl ColormsApp {
                 Color32::from_black_alpha(90),
             );
             painter.circle_filled(center, dot_radius, theme::color32(stored.color.rgb()));
-            painter.circle_stroke(
-                center,
-                dot_radius,
-                Stroke::new(
-                    1.0_f32,
-                    theme::lerp_color(
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 70),
-                        Color32::WHITE,
-                        hover,
-                    ),
-                ),
-            );
             if selected {
                 painter.circle_stroke(
                     center,
@@ -1070,6 +1013,46 @@ fn gradient_color_at(layout: &Layout, theme: &Theme, y: f32) -> Color32 {
     let height = layout.content.height().max(1.0);
     let t = ((y - layout.content.top()) / height).clamp(0.0, 1.0);
     theme::lerp_color(theme.surface_top, theme.surface_bottom, t)
+}
+
+/// Flattens a translucent surface layer onto everything painted behind it (the
+/// window gradient plus the ambient bloom) so the result can be painted opaque.
+/// Translucent figures drawn as triangle fans smear at the seams where two
+/// triangles share an edge, so flat controls are resolved here instead of at
+/// blend time.
+fn over_backdrop(
+    layout: &Layout,
+    metrics: &Metrics,
+    theme: &Theme,
+    pos: egui::Pos2,
+    layer: Color32,
+) -> Color32 {
+    let base = gradient_color_at(layout, theme, pos.y);
+    let radius = metrics.wheel_radius.max(1.0);
+    let dx = (pos.x - metrics.wheel_center.x) / radius;
+    let dy = (pos.y - metrics.wheel_center.y) / radius;
+    // The bloom quad spans `wheel_radius * 1.55`, so its own uv radius is
+    // `sqrt(dx^2 + dy^2)` — the 1.55 factor already sits in the quad size.
+    let distance = (dx * dx + dy * dy).sqrt();
+    let coverage = if distance >= 1.55 {
+        0.0
+    } else {
+        let layers = (15.0f32 * (1.55 - distance) / 0.72).floor() + 1.0;
+        1.0 - (1.0 - 2.0 / 255.0_f32).powi((layers as i32).min(16))
+    };
+    let accent = theme.accent;
+    // `layer` is premultiplied (epaint stores surfaces that way), so a plain
+    // src-over is just `layer + under * (1 - alpha)`.
+    let inverse = 1.0 - layer.a() as f32 / 255.0;
+    let flatten = |premult: u8, bloom: u8, back: u8| -> u8 {
+        let under = bloom as f32 * coverage + back as f32 * (1.0 - coverage);
+        (premult as f32 + under * inverse + 0.5) as u8
+    };
+    Color32::from_rgb(
+        flatten(layer.r(), accent.r(), base.r()),
+        flatten(layer.g(), accent.g(), base.g()),
+        flatten(layer.b(), accent.b(), base.b()),
+    )
 }
 
 pub fn build_font_definitions() -> FontDefinitions {

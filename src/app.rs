@@ -150,6 +150,16 @@ impl ColormsApp {
             ms = startup.elapsed().as_secs_f64() * 1000.0,
             "startup: app::new enter"
         );
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = window_handle {
+            // The window is created hidden and only shown after the first
+            // painted frame. Disable DWM's zoom/fade transition and non-client
+            // rendering so the pre-paint ghost (native titlebar + blank body)
+            // never shows during startup.
+            unsafe {
+                win32_region::prepare_for_show(hwnd);
+            }
+        }
         ctx.set_visuals(egui::Visuals::dark());
         let (fonts, wheel_image) = assets.join(startup);
         ctx.set_fonts(fonts);
@@ -1168,7 +1178,10 @@ impl eframe::App for ColormsApp {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
+        // The window is opaque now; rounded corners come from the Win32
+        // window region, so the GL clear colour just needs to match the
+        // chassis and avoid a black flash before the first painted frame.
+        [32.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0, 1.0]
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1306,5 +1319,89 @@ mod win32_region {
             height: i32,
         ) -> isize;
         pub fn DeleteObject(object: isize) -> i32;
+        fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+        fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
+        fn SetWindowPos(
+            hwnd: isize,
+            after: isize,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            flags: u32,
+        ) -> i32;
+        fn SetClassLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
+        fn CreateSolidBrush(color: u32) -> isize;
+    }
+
+    const GWL_STYLE: i32 = -16;
+    const GCLP_HBRBACKGROUND: i32 = -10;
+    const WS_CAPTION: isize = 0x00C0_0000;
+    const WS_SYSMENU: isize = 0x0008_0000;
+    const WS_MINIMIZEBOX: isize = 0x0002_0000;
+    const WS_MAXIMIZEBOX: isize = 0x0001_0000;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_FRAMECHANGED: u32 = 0x0020;
+
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: isize,
+            attribute: u32,
+            value: *const core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    pub unsafe fn prepare_for_show(hwnd: isize) {
+        // Drop the native caption/sysmenu bits that DWM uses for the pre-paint
+        // ghost. The app paints its own titlebar and window buttons.
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+        let stripped = style & !(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+        if stripped != style {
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, stripped);
+                SetWindowPos(
+                    hwnd,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+                );
+            }
+        }
+        // The class background is what Windows paints before the first GL
+        // frame; make it the same #202020 as the window chassis instead of
+        // white.
+        let brush = unsafe { CreateSolidBrush(0x0020_2020) };
+        if brush != 0 {
+            unsafe {
+                SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, brush);
+            }
+        }
+
+        let on: i32 = 1;
+        // DWMWA_NCRENDERING_POLICY = 2, DWMNCRP_DISABLED = 1.
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                2,
+                (&on as *const i32).cast::<core::ffi::c_void>(),
+                std::mem::size_of::<i32>() as u32,
+            )
+        };
+        // DWMWA_TRANSITIONS_FORCEDISABLED = 3.
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                3,
+                (&on as *const i32).cast::<core::ffi::c_void>(),
+                std::mem::size_of::<i32>() as u32,
+            )
+        };
     }
 }

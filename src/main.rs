@@ -59,7 +59,7 @@ fn main() -> anyhow::Result<()> {
         .with_inner_size(size)
         .with_min_inner_size([520.0, 580.0])
         .with_decorations(false)
-        .with_transparent(true)
+        .with_transparent(false)
         .with_icon(egui::IconData {
             rgba: ICON_BYTES.to_vec(),
             width: ICON_SIZE as u32,

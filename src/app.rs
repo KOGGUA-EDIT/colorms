@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use egui::{
     self, Align2, Color32, ColorImage, CornerRadius, CursorIcon, FontData, FontDefinitions,
-    FontFamily, Id, PointerButton, Rect, ResizeDirection, Sense, Stroke, StrokeKind, TextureHandle,
-    TextureOptions, Ui, Vec2, pos2, vec2,
+    FontFamily, Id, PointerButton, Rect, ResizeDirection, Sense, TextureHandle, TextureOptions, Ui,
+    Vec2, pos2, vec2,
 };
 
 use crate::color::PickerColor;
@@ -271,13 +271,30 @@ impl ColormsApp {
         }
     }
 
-    /// Corner mask for the window outline, rebuilt only when the radius or the
-    /// display scale changes.
-    fn border_corner_texture(&mut self, ctx: &egui::Context, radius: f32) -> egui::TextureId {
-        let side = radius.ceil().max(1.0) + 2.0;
-        let key = side as u32;
+    /// Corner mask for the window outline.
+    ///
+    /// The mask is generated in **physical pixels** and drawn at exactly that
+    /// many pixels (the quad back in points is `side / ppp`), so every texel
+    /// lands on one device pixel. Generating it in points and letting the
+    /// composite scale it shifted the arc by half a texel against the straight
+    /// segments, which read as the outline being one pixel out at the corners.
+    fn border_corner_texture(
+        &mut self,
+        ctx: &egui::Context,
+        radius: f32,
+        thickness: f32,
+        ppp: f32,
+    ) -> (egui::TextureId, f32) {
+        let radius_px = (radius * ppp).round().max(2.0);
+        // Half a pixel of optical correction: an anti-aliased band of exactly
+        // `thickness` pixels only has `thickness - 1` fully covered pixels once
+        // it runs diagonally, so the arc would read thinner than the straight
+        // parts of the same outline.
+        let thickness_px = (thickness * ppp + 0.5).max(1.0);
+        let side_px = radius_px + 2.0;
+        let key = side_px as u32;
         if self.border_corner.is_none() || self.border_side != key {
-            let image = ui::corner_ring_image(side as usize, radius, 2.0);
+            let image = ui::corner_ring_image(side_px as usize, radius_px, thickness_px);
             match &mut self.border_corner {
                 Some(handle) => handle.set(image, egui::TextureOptions::LINEAR),
                 None => {
@@ -290,9 +307,11 @@ impl ColormsApp {
             }
             self.border_side = key;
         }
-        self.border_corner
+        let id = self
+            .border_corner
             .as_ref()
-            .map_or(egui::TextureId::default(), |handle| handle.id())
+            .map_or(egui::TextureId::default(), |handle| handle.id());
+        (id, side_px / ppp)
     }
 
     /// Keep the ambient bloom in sync with the accent colour.
@@ -343,8 +362,21 @@ impl ColormsApp {
 
         if !maximized {
             let radius = ui::WINDOW_RADIUS as f32;
-            let corner = self.border_corner_texture(ctx, radius);
-            ui::paint_window_border(&painter, layout.full, theme.window_border, radius, corner);
+            let ppp = ctx.pixels_per_point();
+            let (corner, side) = self.border_corner_texture(ctx, radius, 2.0, ppp);
+            // The strips overlap the corner masks so their union has no seam, and
+            // an overlap is only invisible when both are painted with the same
+            // opaque colour — so the translucent outline colour is flattened onto
+            // the chassis colour first.
+            ui::paint_window_border(
+                &painter,
+                layout.full,
+                flatten(theme.window_border, theme.footer),
+                radius,
+                2.0 / ppp,
+                side,
+                corner,
+            );
         }
     }
 
@@ -447,17 +479,22 @@ impl ColormsApp {
             rect.bottom() - self.color.value * rect.height(),
         );
         let knob_radius = (6.5 * layout.scale).clamp(4.5, 10.0);
+        let ring = (1.6 * layout.scale).clamp(1.0, 2.2);
+        // Concentric discs instead of two `circle_stroke` calls: a 1–2 px ring
+        // is tessellated into sub-pixel slivers that the rasterizer can only
+        // approximate, which read as a frayed outline. Opaque discs stack
+        // cleanly and leave a crisp ring.
         painter.circle_filled(knob_center + vec2(0.0, 1.5), knob_radius, theme.shadow);
-        painter.circle_filled(knob_center, knob_radius, theme::color32(self.color.rgb()));
-        painter.circle_stroke(
-            knob_center,
-            knob_radius,
-            Stroke::new((1.6 * layout.scale).clamp(1.0, 2.2), Color32::WHITE),
-        );
-        painter.circle_stroke(
+        painter.circle_filled(
             knob_center,
             knob_radius + 1.0,
-            Stroke::new(1.0_f32, Color32::from_black_alpha(60)),
+            Color32::from_black_alpha(60),
+        );
+        painter.circle_filled(knob_center, knob_radius, Color32::WHITE);
+        painter.circle_filled(
+            knob_center,
+            (knob_radius - ring).max(1.0),
+            theme::color32(self.color.rgb()),
         );
     }
 
@@ -753,15 +790,8 @@ impl ColormsApp {
                 (240.0 * alpha) as u8,
             ),
         );
-        painter.rect_stroke(
-            rect,
-            CornerRadius::same(rect_size.y.min(24.0).round() as u8),
-            Stroke::new(
-                1.0_f32,
-                Color32::from_rgba_unmultiplied(255, 255, 255, (36.0 * alpha) as u8),
-            ),
-            StrokeKind::Inside,
-        );
+        // Flat surface: the old 1 px outline was tessellated into sub-pixel
+        // slivers and read as a frayed edge around the bubble.
         painter.galley(rect.center() - size * 0.5, galley, text_color);
         ctx.request_repaint();
     }
@@ -930,6 +960,21 @@ fn gradient_color_at(layout: &Layout, theme: &Theme, y: f32) -> Color32 {
     let height = layout.content.height().max(1.0);
     let t = ((y - layout.content.top()) / height).clamp(0.0, 1.0);
     theme::lerp_color(theme.surface_top, theme.surface_bottom, t)
+}
+
+/// Blends a translucent colour over an opaque one and drops the alpha channel.
+/// Used where an opaque result is required — overlapping translucent pieces
+/// double-blend at the seams, so the window outline is resolved up front.
+fn flatten(color: Color32, under: Color32) -> Color32 {
+    let a = color.a() as u32;
+    let rest = 255 - a;
+    let mix =
+        |top: u8, bottom: u8| -> u8 { ((top as u32 * a + bottom as u32 * rest + 127) / 255) as u8 };
+    Color32::from_rgb(
+        mix(color.r(), under.r()),
+        mix(color.g(), under.g()),
+        mix(color.b(), under.b()),
+    )
 }
 
 /// Flattens a translucent surface layer onto everything painted behind it (the

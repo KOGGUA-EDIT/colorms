@@ -399,6 +399,8 @@ pub fn paint_window_border(
     full: Rect,
     color: Color32,
     radius: f32,
+    thick: f32,
+    side: f32,
     corner: egui::TextureId,
 ) {
     let radius = radius.min(full.width() * 0.5).min(full.height() * 0.5);
@@ -406,38 +408,45 @@ pub fn paint_window_border(
         painter.rect_filled(full.shrink(0.5), CornerRadius::ZERO, color);
         return;
     }
-    let thick = 2.0;
     let (left, top, right, bottom) = (full.left(), full.top(), full.right(), full.bottom());
-    painter.rect_filled(
-        Rect::from_min_max(pos2(left + radius, top), pos2(right - radius, top + thick)),
-        CornerRadius::ZERO,
-        color,
-    );
+    // The strips run a little past the tangent points and the corner masks are
+    // painted first, so their union has no seam wherever the arc lands on the
+    // pixel grid. They are drawn opaque for the same reason: an overlap of the
+    // same opaque colour is invisible, while a translucent overlap would double
+    // blend into a darker wedge at every corner.
+    let over = thick;
     painter.rect_filled(
         Rect::from_min_max(
-            pos2(left + radius, bottom - thick),
-            pos2(right - radius, bottom),
+            pos2(left + radius - over, top),
+            pos2(right - radius + over, top + thick),
         ),
         CornerRadius::ZERO,
         color,
     );
     painter.rect_filled(
         Rect::from_min_max(
-            pos2(left, top + radius),
-            pos2(left + thick, bottom - radius),
+            pos2(left + radius - over, bottom - thick),
+            pos2(right - radius + over, bottom),
         ),
         CornerRadius::ZERO,
         color,
     );
     painter.rect_filled(
         Rect::from_min_max(
-            pos2(right - thick, top + radius),
-            pos2(right, bottom - radius),
+            pos2(left, top + radius - over),
+            pos2(left + thick, bottom - radius + over),
         ),
         CornerRadius::ZERO,
         color,
     );
-    let side = radius.ceil() + 2.0;
+    painter.rect_filled(
+        Rect::from_min_max(
+            pos2(right - thick, top + radius - over),
+            pos2(right, bottom - radius + over),
+        ),
+        CornerRadius::ZERO,
+        color,
+    );
     for (rect, uv) in [
         (
             Rect::from_min_max(pos2(left, top), pos2(left + side, top + side)),

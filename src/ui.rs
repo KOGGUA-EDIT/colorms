@@ -128,17 +128,38 @@ pub fn wheel_image(size: usize) -> ColorImage {
     let size = size.max(32);
     let mut pixels = Vec::with_capacity(size * size);
     let radius = size as f32 * 0.5;
+    // Precompute the fully saturated hue ring once. For V=1, any lower
+    // saturation is just a lerp from white towards that ring, which avoids a
+    // full HSV conversion (and its branches) for every one of the pixels.
+    const HUE_STEPS: usize = 4096;
+    let mut hue_ring = vec![(0u8, 0u8, 0u8); HUE_STEPS];
+    for (step, entry) in hue_ring.iter_mut().enumerate() {
+        let hue = step as f32 * (360.0 / HUE_STEPS as f32);
+        let rgb = hsv_to_rgb(hue, 1.0, 1.0);
+        *entry = (rgb.r, rgb.g, rgb.b);
+    }
     for y in 0..size {
         for x in 0..size {
             let dx = x as f32 + 0.5 - radius;
             let dy = y as f32 + 0.5 - radius;
             let distance = (dx * dx + dy * dy).sqrt();
             let saturation = (distance / radius).clamp(0.0, 1.0);
-            let hue = (-dy).atan2(dx).to_degrees().rem_euclid(360.0);
-            let rgb = hsv_to_rgb(hue, saturation, 1.0);
+            let angle = (-dy).atan2(dx);
+            let index = ((angle.rem_euclid(std::f32::consts::TAU)
+                * (HUE_STEPS as f32 / std::f32::consts::TAU)) as usize)
+                .min(HUE_STEPS - 1);
+            let (hue_r, hue_g, hue_b) = hue_ring[index];
+            let mix = |channel: u8| -> u8 {
+                (255.0 + (channel as f32 - 255.0) * saturation).round() as u8
+            };
             let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
             let alpha = (coverage * 255.0 + 0.5) as u8;
-            pixels.push(Color32::from_rgba_unmultiplied(rgb.r, rgb.g, rgb.b, alpha));
+            pixels.push(Color32::from_rgba_unmultiplied(
+                mix(hue_r),
+                mix(hue_g),
+                mix(hue_b),
+                alpha,
+            ));
         }
     }
     ColorImage::new([size, size], pixels)

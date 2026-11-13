@@ -4,7 +4,7 @@
 )]
 
 use anyhow::Context as _;
-use colorms::app::ColormsApp;
+use colorms::app::{ColormsApp, StartupAssets};
 use colorms::color::PickerColor;
 use colorms::db::{self, Db};
 use eframe::egui;
@@ -15,10 +15,23 @@ const ICON_SIZE: usize = 256;
 const DEFAULT_SIZE: [f32; 2] = [640.0, 720.0];
 
 fn main() -> anyhow::Result<()> {
+    let startup = std::time::Instant::now();
     let _guard = init_tracing();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting Colorms");
+    tracing::info!(
+        ms = startup.elapsed().as_secs_f64() * 1000.0,
+        "startup: tracing ready"
+    );
+
+    // Read the fonts and generate the colour-wheel image while eframe creates
+    // the window and its GL context; this keeps ~80 ms off the critical path.
+    let startup_assets = StartupAssets::spawn();
 
     let (db, db_note) = open_db()?;
+    tracing::info!(
+        ms = startup.elapsed().as_secs_f64() * 1000.0,
+        "startup: database ready"
+    );
     let initial_color = match db.load_last_color() {
         Ok(Some(color)) => color,
         Ok(None) => PickerColor::default(),
@@ -60,14 +73,23 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    tracing::info!(
+        ms = startup.elapsed().as_secs_f64() * 1000.0,
+        "startup: entering eframe"
+    );
     eframe::run_native(
         "Colorms",
         options,
         Box::new(move |cc| {
-            Ok(
-                Box::new(ColormsApp::new(cc, db, initial_color, size, db_note))
-                    as Box<dyn eframe::App>,
-            )
+            Ok(Box::new(ColormsApp::new(
+                cc,
+                db,
+                initial_color,
+                size,
+                db_note,
+                startup,
+                startup_assets,
+            )) as Box<dyn eframe::App>)
         }),
     )
     .map_err(|err| anyhow::anyhow!("eframe failed to run: {err}"))

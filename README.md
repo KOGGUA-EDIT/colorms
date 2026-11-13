@@ -26,9 +26,18 @@
 | `Ctrl + C` | 复制当前颜色 |
 | `Esc` | 关闭提示气泡 |
 
+## 性能
+
+冷启动按“进程启动 → 首帧”优化（本机热缓存测试，中位数约 300 ms）：
+
+- 字体读取和 768² 色盘纹理生成放在后台线程，与 winit/GL 初始化重叠；首帧只负责上传纹理和绘制。
+- 色盘纹理由 4096 阶色相 LUT + 白色混合生成，不再逐像素做 HSV 转换。
+- 发布版使用 `lto = "fat"`、`codegen-units = 1`、`panic = "abort"`、`strip = true`，可执行文件约 5.3 MB。
+- 使用 Windows 系统字体（Segoe UI / 等线 / Consolas），不内嵌字体资源。
+
 ## 技术栈
 
-- GUI：`eframe` / `egui` 0.33.3（glow 后端，全自绘控件）
+- GUI：`eframe` / `egui` 0.33.3（glow 后端，仅保留 glow feature，全自绘控件）
 - 存储：`rusqlite` 0.37（bundled SQLite，WAL 模式）
 - 序列化：`serde` / `serde_json`
 - 错误处理：`thiserror`（数据层）+ `anyhow`（应用层）

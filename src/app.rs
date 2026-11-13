@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
@@ -45,6 +46,58 @@ enum WindowAction {
     Close,
 }
 
+/// CPU-only startup assets, built on background threads while eframe creates
+/// the window and its OpenGL context. By the time the app creator runs they are
+/// normally ready, so only the GPU upload stays on the critical path.
+pub struct StartupAssets {
+    fonts: JoinHandle<FontDefinitions>,
+    wheel: JoinHandle<ColorImage>,
+}
+
+impl StartupAssets {
+    pub fn spawn() -> Self {
+        let fonts = std::thread::Builder::new()
+            .name("colorms-fonts".to_owned())
+            .spawn(build_font_definitions)
+            .expect("could not spawn the font loader thread");
+        let wheel = std::thread::Builder::new()
+            .name("colorms-wheel".to_owned())
+            .spawn(|| {
+                let started = Instant::now();
+                let image = ui::wheel_image(768);
+                tracing::info!(
+                    ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "startup: wheel image generated"
+                );
+                image
+            })
+            .expect("could not spawn the wheel texture thread");
+        Self { fonts, wheel }
+    }
+
+    fn join(self, startup: Instant) -> (FontDefinitions, ColorImage) {
+        let fonts = match self.fonts.join() {
+            Ok(fonts) => fonts,
+            Err(err) => {
+                tracing::error!("font loader thread failed: {err:?}");
+                build_font_definitions()
+            }
+        };
+        let wheel = match self.wheel.join() {
+            Ok(image) => image,
+            Err(err) => {
+                tracing::error!("wheel texture thread failed: {err:?}");
+                ui::wheel_image(768)
+            }
+        };
+        tracing::info!(
+            ms = startup.elapsed().as_secs_f64() * 1000.0,
+            "startup: background assets joined"
+        );
+        (fonts, wheel)
+    }
+}
+
 pub struct ColormsApp {
     color: PickerColor,
     db: Db,
@@ -64,6 +117,8 @@ pub struct ColormsApp {
     last_size: Vec2,
     persisted_size: Vec2,
     last_size_change: Instant,
+    startup: Instant,
+    startup_logged: bool,
 }
 
 impl ColormsApp {
@@ -73,15 +128,26 @@ impl ColormsApp {
         initial_color: PickerColor,
         initial_size: [f32; 2],
         db_note: Option<String>,
+        startup: Instant,
+        assets: StartupAssets,
     ) -> Self {
         let ctx = &cc.egui_ctx;
+        tracing::info!(
+            ms = startup.elapsed().as_secs_f64() * 1000.0,
+            "startup: app::new enter"
+        );
         ctx.set_visuals(egui::Visuals::dark());
-        install_fonts(ctx);
+        let (fonts, wheel_image) = assets.join(startup);
+        ctx.set_fonts(fonts);
+        tracing::info!(
+            ms = startup.elapsed().as_secs_f64() * 1000.0,
+            "startup: fonts installed"
+        );
 
-        let wheel = ctx.load_texture(
-            "colorms-wheel",
-            ui::wheel_image(768),
-            TextureOptions::LINEAR,
+        let wheel = ctx.load_texture("colorms-wheel", wheel_image, TextureOptions::LINEAR);
+        tracing::info!(
+            ms = startup.elapsed().as_secs_f64() * 1000.0,
+            "startup: wheel texture"
         );
         let slider = ctx.load_texture(
             "colorms-brightness",
@@ -93,6 +159,10 @@ impl ColormsApp {
             ColorImage::from_rgba_unmultiplied([BRAND_SIZE, BRAND_SIZE], BRAND_BYTES),
             TextureOptions::LINEAR,
         );
+        tracing::info!(
+            ms = startup.elapsed().as_secs_f64() * 1000.0,
+            "startup: slider+brand textures"
+        );
 
         let recent = match db.recent_colors(RECENT_LIMIT) {
             Ok(colors) => colors,
@@ -101,6 +171,10 @@ impl ColormsApp {
                 Vec::new()
             }
         };
+        tracing::info!(
+            ms = startup.elapsed().as_secs_f64() * 1000.0,
+            "startup: recent colours"
+        );
 
         let mut app = Self {
             color: initial_color.clamped(),
@@ -117,6 +191,8 @@ impl ColormsApp {
             last_size: vec2(initial_size[0], initial_size[1]),
             persisted_size: vec2(initial_size[0], initial_size[1]),
             last_size_change: Instant::now(),
+            startup,
+            startup_logged: false,
         };
         if let Some(note) = db_note {
             app.pending_toast = Some((note, 3.6));
@@ -963,6 +1039,13 @@ impl ColormsApp {
 
 impl eframe::App for ColormsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.startup_logged {
+            self.startup_logged = true;
+            tracing::info!(
+                ms = self.startup.elapsed().as_secs_f64() * 1000.0,
+                "startup: first update"
+            );
+        }
         let now = ctx.input(|i| i.time);
         let full = ctx.content_rect();
         if full.width() < 50.0 || full.height() < 50.0 {
@@ -1034,7 +1117,8 @@ fn text_width(painter: &egui::Painter, text: &str, font: egui::FontId) -> f32 {
         .x
 }
 
-fn install_fonts(ctx: &egui::Context) {
+fn build_font_definitions() -> FontDefinitions {
+    let started = Instant::now();
     let mut fonts = FontDefinitions::default();
     let fonts_dir = std::env::var_os("WINDIR")
         .map(PathBuf::from)
@@ -1044,9 +1128,7 @@ fn install_fonts(ctx: &egui::Context) {
     let candidates = [
         ("Segoe UI", "segoeui.ttf"),
         ("Segoe UI Bold", "segoeuib.ttf"),
-        ("Segoe UI Semibold", "seguisb.ttf"),
         ("DengXian", "Deng.ttf"),
-        ("DengXian Bold", "Dengb.ttf"),
         ("Consolas", "consola.ttf"),
     ];
     let mut loaded: Vec<&str> = Vec::new();
@@ -1099,13 +1181,7 @@ fn install_fonts(ctx: &egui::Context) {
     fonts.families.insert(FontFamily::Monospace, monospace);
 
     let mut display = Vec::new();
-    for key in [
-        "Segoe UI Semibold",
-        "Segoe UI Bold",
-        "Segoe UI",
-        "DengXian Bold",
-        "DengXian",
-    ] {
+    for key in ["Segoe UI Bold", "Segoe UI", "DengXian"] {
         if has(key) && !display.iter().any(|existing: &String| existing == key) {
             display.push(key.to_owned());
         }
@@ -1128,8 +1204,9 @@ fn install_fonts(ctx: &egui::Context) {
         .insert(FontFamily::Name(FONT_MONO.into()), mono_display);
 
     tracing::info!(
+        ms = started.elapsed().as_secs_f64() * 1000.0,
         loaded = ?loaded,
-        "installed system fonts"
+        "prepared system fonts"
     );
-    ctx.set_fonts(fonts);
+    fonts
 }

@@ -4,7 +4,7 @@
 //! while the very bottom strip (the footer) stays exactly `#202020` as asked.
 
 use crate::color::{PickerColor, Rgb8, readable_on};
-use eframe::egui::Color32;
+use egui::Color32;
 
 pub const FOOTER_RGB: Rgb8 = Rgb8::new(0x20, 0x20, 0x20);
 

@@ -1,27 +1,45 @@
 //! The Colorms window: custom-painted Material You picker.
+//!
+//! This is a faithful port of the original egui painter code onto the CPU
+//! rasterizer in [`crate::gfx`]. All geometry, colours and interactions match
+//! the previous build; only the shell (window bootstrap and presentation) is
+//! different, so the app no longer needs eframe, winit's GL bridge or a GPU
+//! driver at startup.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{
+use egui::{
     self, Align2, Color32, ColorImage, CornerRadius, CursorIcon, FontData, FontDefinitions,
     FontFamily, Id, PointerButton, Rect, ResizeDirection, Sense, Stroke, StrokeKind, TextureHandle,
-    TextureOptions, Ui, Vec2, ViewportCommand, pos2, vec2,
+    TextureOptions, Ui, Vec2, pos2, vec2,
 };
-#[cfg(target_os = "windows")]
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::color::PickerColor;
 use crate::db::{Db, RECENT_LIMIT, StoredColor};
 use crate::theme::{self, Theme};
+use crate::trace;
 use crate::ui::{self, FONT_DISPLAY, FONT_MONO, Layout, Metrics};
 
 const BRAND_BYTES: &[u8] = include_bytes!("../assets/brand_96.rgba");
 const BRAND_SIZE: usize = 96;
 
 const DEFAULT_DURATION: f32 = 1.9;
+/// Resolution of the baked ambient bloom (it is a smooth radial ramp).
+const GLOW_SIZE: usize = 128;
+
+/// Window operations the app asks the shell to perform. The old build sent
+/// `eframe` viewport commands; the new shell executes these directly with winit.
+#[derive(Clone, Copy, Debug)]
+pub enum Command {
+    Minimize,
+    ToggleMaximize,
+    Close,
+    StartDrag,
+    Resize(ResizeDirection),
+}
 
 struct Toast {
     text: String,
@@ -48,9 +66,8 @@ enum WindowAction {
     Close,
 }
 
-/// CPU-only startup assets, built on background threads while eframe creates
-/// the window and its OpenGL context. By the time the app creator runs they are
-/// normally ready, so only the GPU upload stays on the critical path.
+/// CPU-only startup assets, built on background threads while the shell creates
+/// the window. By the time the app is constructed they are normally ready.
 pub struct StartupAssets {
     fonts: JoinHandle<FontDefinitions>,
     wheel: JoinHandle<ColorImage>,
@@ -67,10 +84,10 @@ impl StartupAssets {
             .spawn(|| {
                 let started = Instant::now();
                 let image = ui::wheel_image(768);
-                tracing::info!(
-                    ms = started.elapsed().as_secs_f64() * 1000.0,
-                    "startup: wheel image generated"
-                );
+                trace::mark(&format!(
+                    "startup: wheel image generated ({:.1} ms)",
+                    started.elapsed().as_secs_f64() * 1000.0
+                ));
                 image
             })
             .expect("could not spawn the wheel texture thread");
@@ -81,21 +98,21 @@ impl StartupAssets {
         let fonts = match self.fonts.join() {
             Ok(fonts) => fonts,
             Err(err) => {
-                tracing::error!("font loader thread failed: {err:?}");
+                eprintln!("font loader thread failed: {err:?}");
                 build_font_definitions()
             }
         };
         let wheel = match self.wheel.join() {
             Ok(image) => image,
             Err(err) => {
-                tracing::error!("wheel texture thread failed: {err:?}");
+                eprintln!("wheel texture thread failed: {err:?}");
                 ui::wheel_image(768)
             }
         };
-        tracing::info!(
-            ms = startup.elapsed().as_secs_f64() * 1000.0,
-            "startup: background assets joined"
-        );
+        trace::mark(&format!(
+            "startup: background assets joined ({:.1} ms)",
+            startup.elapsed().as_secs_f64() * 1000.0
+        ));
         (fonts, wheel)
     }
 }
@@ -110,6 +127,9 @@ pub struct ColormsApp {
     wheel: TextureHandle,
     slider: TextureHandle,
     brand: TextureHandle,
+    /// Baked ambient bloom; regenerated when the accent colour changes.
+    glow: Option<TextureHandle>,
+    glow_key: [u8; 4],
 
     dirty: bool,
     touched: bool,
@@ -121,15 +141,14 @@ pub struct ColormsApp {
     last_size_change: Instant,
     startup: Instant,
     startup_logged: bool,
-    #[cfg(target_os = "windows")]
-    window_handle: Option<isize>,
-    #[cfg(target_os = "windows")]
-    applied_region: Option<(i32, i32, i32, bool)>,
+    /// Window commands collected while painting, executed by the shell.
+    pub commands: Vec<Command>,
 }
 
 impl ColormsApp {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cc: &eframe::CreationContext<'_>,
+        ctx: &egui::Context,
         db: Db,
         initial_color: PickerColor,
         initial_size: [f32; 2],
@@ -137,68 +156,36 @@ impl ColormsApp {
         startup: Instant,
         assets: StartupAssets,
     ) -> Self {
-        let ctx = &cc.egui_ctx;
-        #[cfg(target_os = "windows")]
-        let window_handle = cc
-            .window_handle()
-            .ok()
-            .and_then(|handle| match handle.as_raw() {
-                RawWindowHandle::Win32(window) => Some(window.hwnd.get() as isize),
-                _ => None,
-            });
-        tracing::info!(
-            ms = startup.elapsed().as_secs_f64() * 1000.0,
-            "startup: app::new enter"
-        );
-        #[cfg(target_os = "windows")]
-        if let Some(hwnd) = window_handle {
-            // The window is created hidden and only shown after the first
-            // painted frame. Disable DWM's zoom/fade transition and non-client
-            // rendering so the pre-paint ghost (native titlebar + blank body)
-            // never shows during startup.
-            unsafe {
-                win32_region::prepare_for_show(hwnd);
-            }
-        }
+        trace::mark("startup: app::new enter");
         ctx.set_visuals(egui::Visuals::dark());
+        trace::mark("startup: visuals set");
         let (fonts, wheel_image) = assets.join(startup);
         ctx.set_fonts(fonts);
-        tracing::info!(
-            ms = startup.elapsed().as_secs_f64() * 1000.0,
-            "startup: fonts installed"
-        );
+        trace::mark("startup: fonts installed");
 
         let wheel = ctx.load_texture("colorms-wheel", wheel_image, TextureOptions::LINEAR);
-        tracing::info!(
-            ms = startup.elapsed().as_secs_f64() * 1000.0,
-            "startup: wheel texture"
-        );
+        trace::mark("startup: wheel texture");
         let slider = ctx.load_texture(
             "colorms-brightness",
             ui::brightness_image(108, 700),
             TextureOptions::LINEAR,
         );
+        trace::mark("startup: slider texture");
         let brand = ctx.load_texture(
             "colorms-brand",
             ColorImage::from_rgba_unmultiplied([BRAND_SIZE, BRAND_SIZE], BRAND_BYTES),
             TextureOptions::LINEAR,
         );
-        tracing::info!(
-            ms = startup.elapsed().as_secs_f64() * 1000.0,
-            "startup: slider+brand textures"
-        );
+        trace::mark("startup: slider+brand textures");
 
         let recent = match db.recent_colors(RECENT_LIMIT) {
             Ok(colors) => colors,
             Err(err) => {
-                tracing::warn!("could not load recent colours: {err}");
+                eprintln!("could not load recent colours: {err}");
                 Vec::new()
             }
         };
-        tracing::info!(
-            ms = startup.elapsed().as_secs_f64() * 1000.0,
-            "startup: recent colours"
-        );
+        trace::mark("startup: recent colours");
 
         let mut app = Self {
             color: initial_color.clamped(),
@@ -209,6 +196,8 @@ impl ColormsApp {
             wheel,
             slider,
             brand,
+            glow: None,
+            glow_key: [0; 4],
             dirty: false,
             touched: false,
             copied_hex: None,
@@ -217,10 +206,7 @@ impl ColormsApp {
             last_size_change: Instant::now(),
             startup,
             startup_logged: false,
-            #[cfg(target_os = "windows")]
-            window_handle,
-            #[cfg(target_os = "windows")]
-            applied_region: None,
+            commands: Vec::new(),
         };
         if let Some(note) = db_note {
             app.pending_toast = Some((note, 3.6));
@@ -231,7 +217,7 @@ impl ColormsApp {
     fn copy_current(&mut self, ctx: &egui::Context, now: f64) {
         let hex = self.color.hex();
         ctx.copy_text(hex.clone());
-        tracing::info!("copied {hex} to clipboard");
+        trace::mark(&format!("copied {hex} to clipboard"));
         self.copied_hex = Some(hex.clone());
         let saved = self.commit(now);
         if saved {
@@ -248,23 +234,23 @@ impl ColormsApp {
             Ok(()) => self.refresh_recent(),
             Err(err) => {
                 ok = false;
-                tracing::error!("failed to save colour {hex}: {err}");
+                eprintln!("failed to save colour {hex}: {err}");
                 self.show_toast("保存失败：数据库不可写".to_owned(), now);
             }
         }
         if let Err(err) = self.db.save_last_color(self.color) {
-            tracing::warn!("failed to save last colour: {err}");
+            eprintln!("failed to save last colour: {err}");
         }
         self.dirty = false;
         self.touched = true;
         ok
     }
 
-    fn persist_now(&mut self) {
+    pub fn persist_now(&mut self) {
         let _ = self.db.save_last_color(self.color);
         if self.dirty || self.touched {
             if let Err(err) = self.db.save_color(self.color) {
-                tracing::warn!("failed to save colour on exit: {err}");
+                eprintln!("failed to save colour on exit: {err}");
             }
             self.dirty = false;
             self.refresh_recent();
@@ -278,7 +264,7 @@ impl ColormsApp {
     fn refresh_recent(&mut self) {
         match self.db.recent_colors(RECENT_LIMIT) {
             Ok(colors) => self.recent = colors,
-            Err(err) => tracing::warn!("could not refresh recent colours: {err}"),
+            Err(err) => eprintln!("could not refresh recent colours: {err}"),
         }
     }
 
@@ -305,63 +291,35 @@ impl ColormsApp {
         {
             match self.db.save_window_size(size.x, size.y) {
                 Ok(()) => self.persisted_size = size,
-                Err(err) => tracing::warn!("failed to save window size: {err}"),
+                Err(err) => eprintln!("failed to save window size: {err}"),
             }
             self.last_size_change = Instant::now();
         }
     }
 
-    #[cfg(target_os = "windows")]
-    fn update_rounded_region(&mut self, ctx: &egui::Context, maximized: bool) {
-        let Some(hwnd) = self.window_handle else {
-            return;
-        };
-        let mut rect = win32_region::Rect {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
-        if unsafe { win32_region::GetClientRect(hwnd, &mut rect) } == 0 {
-            return;
-        }
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-        if width <= 0 || height <= 0 {
-            return;
-        }
-        // A rounded window region removes the square, black corners that DWM
-        // leaves behind around the transparent chassis on Windows.
-        let radius = if maximized {
-            0
-        } else {
-            (ui::WINDOW_RADIUS as f32 * ctx.pixels_per_point()).round() as i32
-        };
-        let key = (width, height, radius, maximized);
-        if self.applied_region == Some(key) {
-            return;
-        }
-        if radius <= 0 {
-            if unsafe { win32_region::SetWindowRgn(hwnd, 0, 1) } != 0 {
-                self.applied_region = Some(key);
+    /// Keep the ambient bloom in sync with the accent colour.
+    fn glow_texture(&mut self, ctx: &egui::Context, accent: Color32) -> egui::TextureId {
+        let key = accent.to_array();
+        if self.glow.is_none() || self.glow_key != key {
+            let image = ui::glow_image(GLOW_SIZE, accent);
+            // Nearest sampling: the ramp is so faint (max alpha 31) that the
+            // 4 px texel steps are invisible, while linear filtering would cost
+            // four weighted fetches for every one of the 326k glow pixels.
+            match &mut self.glow {
+                Some(handle) => handle.set(image, egui::TextureOptions::NEAREST),
+                None => {
+                    self.glow = Some(ctx.load_texture(
+                        "colorms-glow",
+                        image,
+                        egui::TextureOptions::NEAREST,
+                    ));
+                }
             }
-            return;
+            self.glow_key = key;
         }
-        let region = unsafe {
-            win32_region::CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2)
-        };
-        if region == 0 {
-            return;
-        }
-        if unsafe { win32_region::SetWindowRgn(hwnd, region, 1) } != 0 {
-            self.applied_region = Some(key);
-        } else {
-            // SetWindowRgn did not take ownership on failure.
-            unsafe {
-                win32_region::DeleteObject(region);
-            }
-            self.applied_region = None;
-        }
+        self.glow
+            .as_ref()
+            .map_or(egui::TextureId::default(), |handle| handle.id())
     }
 
     fn draw(&mut self, ctx: &egui::Context, ui: &Ui, full: Rect, now: f64, maximized: bool) {
@@ -372,7 +330,8 @@ impl ColormsApp {
         let radius = if maximized { 0 } else { ui::WINDOW_RADIUS };
 
         ui::paint_background(&painter, &layout, &theme, radius);
-        ui::paint_ambient_glow(&painter, &layout, &metrics, &theme);
+        let glow = self.glow_texture(ctx, theme.accent);
+        ui::paint_ambient_glow(&painter, &layout, &metrics, glow);
         ui::titlebar_hairline(&painter, layout.title);
         ui::footer_hairline(&painter, layout.footer);
 
@@ -812,7 +771,7 @@ impl ColormsApp {
                     ctx.request_repaint();
                 }
                 Err(err) => {
-                    tracing::error!("failed to delete {hex}: {err}");
+                    eprintln!("failed to delete {hex}: {err}");
                     self.show_toast("删除失败：数据库不可写".to_owned(), now);
                 }
             }
@@ -868,9 +827,9 @@ impl ColormsApp {
             Sense::click_and_drag(),
         );
         if drag.double_clicked() {
-            ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+            self.commands.push(Command::ToggleMaximize);
         } else if drag.drag_started_by(PointerButton::Primary) {
-            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            self.commands.push(Command::StartDrag);
         }
 
         self.window_button(
@@ -936,7 +895,6 @@ impl ColormsApp {
         }
 
         let icon_color = match (action, response.hovered()) {
-            (WindowAction::Close, true) => Color32::WHITE,
             (_, true) => Color32::WHITE,
             _ => theme.text_muted,
         };
@@ -954,15 +912,11 @@ impl ColormsApp {
 
         if response.clicked() {
             match action {
-                WindowAction::Minimize => {
-                    ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-                }
-                WindowAction::Maximize => {
-                    ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
-                }
+                WindowAction::Minimize => self.commands.push(Command::Minimize),
+                WindowAction::Maximize => self.commands.push(Command::ToggleMaximize),
                 WindowAction::Close => {
                     self.persist_now();
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    self.commands.push(Command::Close);
                 }
             }
         }
@@ -1112,29 +1066,25 @@ impl ColormsApp {
                 ctx.set_cursor_icon(cursor);
             }
             if primary_pressed && response.is_pointer_button_down_on() {
-                ctx.send_viewport_cmd(ViewportCommand::BeginResize(direction));
+                self.commands.push(Command::Resize(direction));
             }
         }
     }
-}
 
-impl eframe::App for ColormsApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// Paint one frame. Returns `true` when the shell should close the window.
+    pub fn update(&mut self, ctx: &egui::Context, maximized: bool) -> bool {
         if !self.startup_logged {
             self.startup_logged = true;
-            tracing::info!(
-                ms = self.startup.elapsed().as_secs_f64() * 1000.0,
-                "startup: first update"
-            );
+            trace::mark(&format!(
+                "startup: first update ({:.1} ms)",
+                self.startup.elapsed().as_secs_f64() * 1000.0
+            ));
         }
         let now = ctx.input(|i| i.time);
         let full = ctx.content_rect();
         if full.width() < 50.0 || full.height() < 50.0 {
-            return;
+            return false;
         }
-        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-        #[cfg(target_os = "windows")]
-        self.update_rounded_region(ctx, maximized);
         self.track_size(full.size(), maximized);
 
         if let Some((text, duration)) = self.pending_toast.take() {
@@ -1145,11 +1095,15 @@ impl eframe::App for ColormsApp {
             });
         }
 
-        if ctx.input(|i| i.viewport().close_requested()) {
-            self.persist_now();
-        }
-
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+        // `egui-winit` turns Ctrl+C into `Event::Copy` instead of a `Key` press,
+        // so the shortcut has to be recognised from the event list as well.
+        let copy_requested = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy))
+                || (i.modifiers.command && i.key_pressed(egui::Key::C))
+        });
+        if copy_requested {
             self.copy_current(ctx, now);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1175,18 +1129,7 @@ impl eframe::App for ColormsApp {
                 ctx.request_repaint();
             }
         }
-    }
-
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // The window is opaque now; rounded corners come from the Win32
-        // window region, so the GL clear colour just needs to match the
-        // chassis and avoid a black flash before the first painted frame.
-        [32.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0, 1.0]
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.persist_now();
-        tracing::info!("Colorms exited");
+        false
     }
 }
 
@@ -1203,7 +1146,7 @@ fn text_width(painter: &egui::Painter, text: &str, font: egui::FontId) -> f32 {
         .x
 }
 
-fn build_font_definitions() -> FontDefinitions {
+pub fn build_font_definitions() -> FontDefinitions {
     let started = Instant::now();
     let mut fonts = FontDefinitions::default();
     let fonts_dir = std::env::var_os("WINDIR")
@@ -1227,7 +1170,7 @@ fn build_font_definitions() -> FontDefinitions {
                 loaded.push(key);
             }
             Err(err) => {
-                tracing::debug!("font {file} unavailable: {err}");
+                eprintln!("font {file} unavailable: {err}");
             }
         }
     }
@@ -1289,119 +1232,10 @@ fn build_font_definitions() -> FontDefinitions {
         .families
         .insert(FontFamily::Name(FONT_MONO.into()), mono_display);
 
-    tracing::info!(
-        ms = started.elapsed().as_secs_f64() * 1000.0,
-        loaded = ?loaded,
-        "prepared system fonts"
-    );
+    trace::mark(&format!(
+        "prepared system fonts ({:.1} ms, {:?})",
+        started.elapsed().as_secs_f64() * 1000.0,
+        loaded
+    ));
     fonts
-}
-
-#[cfg(target_os = "windows")]
-mod win32_region {
-    #[repr(C)]
-    pub struct Rect {
-        pub left: i32,
-        pub top: i32,
-        pub right: i32,
-        pub bottom: i32,
-    }
-
-    unsafe extern "system" {
-        pub fn GetClientRect(hwnd: isize, rect: *mut Rect) -> i32;
-        pub fn SetWindowRgn(hwnd: isize, region: isize, redraw: i32) -> i32;
-        pub fn CreateRoundRectRgn(
-            left: i32,
-            top: i32,
-            right: i32,
-            bottom: i32,
-            width: i32,
-            height: i32,
-        ) -> isize;
-        pub fn DeleteObject(object: isize) -> i32;
-        fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
-        fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
-        fn SetWindowPos(
-            hwnd: isize,
-            after: isize,
-            x: i32,
-            y: i32,
-            width: i32,
-            height: i32,
-            flags: u32,
-        ) -> i32;
-        fn SetClassLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
-        fn CreateSolidBrush(color: u32) -> isize;
-    }
-
-    const GWL_STYLE: i32 = -16;
-    const GCLP_HBRBACKGROUND: i32 = -10;
-    const WS_CAPTION: isize = 0x00C0_0000;
-    const WS_SYSMENU: isize = 0x0008_0000;
-    const WS_MINIMIZEBOX: isize = 0x0002_0000;
-    const WS_MAXIMIZEBOX: isize = 0x0001_0000;
-    const SWP_NOSIZE: u32 = 0x0001;
-    const SWP_NOMOVE: u32 = 0x0002;
-    const SWP_NOZORDER: u32 = 0x0004;
-    const SWP_FRAMECHANGED: u32 = 0x0020;
-
-    #[link(name = "dwmapi")]
-    unsafe extern "system" {
-        fn DwmSetWindowAttribute(
-            hwnd: isize,
-            attribute: u32,
-            value: *const core::ffi::c_void,
-            size: u32,
-        ) -> i32;
-    }
-
-    pub unsafe fn prepare_for_show(hwnd: isize) {
-        // Drop the native caption/sysmenu bits that DWM uses for the pre-paint
-        // ghost. The app paints its own titlebar and window buttons.
-        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
-        let stripped = style & !(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
-        if stripped != style {
-            unsafe {
-                SetWindowLongPtrW(hwnd, GWL_STYLE, stripped);
-                SetWindowPos(
-                    hwnd,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-                );
-            }
-        }
-        // The class background is what Windows paints before the first GL
-        // frame; make it the same #202020 as the window chassis instead of
-        // white.
-        let brush = unsafe { CreateSolidBrush(0x0020_2020) };
-        if brush != 0 {
-            unsafe {
-                SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, brush);
-            }
-        }
-
-        let on: i32 = 1;
-        // DWMWA_NCRENDERING_POLICY = 2, DWMNCRP_DISABLED = 1.
-        let _ = unsafe {
-            DwmSetWindowAttribute(
-                hwnd,
-                2,
-                (&on as *const i32).cast::<core::ffi::c_void>(),
-                std::mem::size_of::<i32>() as u32,
-            )
-        };
-        // DWMWA_TRANSITIONS_FORCEDISABLED = 3.
-        let _ = unsafe {
-            DwmSetWindowAttribute(
-                hwnd,
-                3,
-                (&on as *const i32).cast::<core::ffi::c_void>(),
-                std::mem::size_of::<i32>() as u32,
-            )
-        };
-    }
 }

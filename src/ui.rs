@@ -4,7 +4,7 @@
 //! that matches `ui.vectorcraft` (576×576 artboard) and scales with the window.
 
 use crate::color::hsv_to_rgb;
-use eframe::egui::{
+use egui::{
     self, Align2, Color32, ColorImage, CornerRadius, FontFamily, FontId, Painter, Pos2, Rect,
     Stroke, StrokeKind, Vec2, pos2, vec2,
 };
@@ -126,7 +126,6 @@ impl Metrics {
 /// filtering never produces a dark halo around the wheel.
 pub fn wheel_image(size: usize) -> ColorImage {
     let size = size.max(32);
-    let mut pixels = Vec::with_capacity(size * size);
     let radius = size as f32 * 0.5;
     // Precompute the fully saturated hue ring once. For V=1, any lower
     // saturation is just a lerp from white towards that ring, which avoids a
@@ -138,30 +137,47 @@ pub fn wheel_image(size: usize) -> ColorImage {
         let rgb = hsv_to_rgb(hue, 1.0, 1.0);
         *entry = (rgb.r, rgb.g, rgb.b);
     }
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 + 0.5 - radius;
-            let dy = y as f32 + 0.5 - radius;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let saturation = (distance / radius).clamp(0.0, 1.0);
-            let angle = (-dy).atan2(dx);
-            let index = ((angle.rem_euclid(std::f32::consts::TAU)
-                * (HUE_STEPS as f32 / std::f32::consts::TAU)) as usize)
-                .min(HUE_STEPS - 1);
-            let (hue_r, hue_g, hue_b) = hue_ring[index];
-            let mix = |channel: u8| -> u8 {
-                (255.0 + (channel as f32 - 255.0) * saturation).round() as u8
-            };
-            let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
-            let alpha = (coverage * 255.0 + 0.5) as u8;
-            pixels.push(Color32::from_rgba_unmultiplied(
-                mix(hue_r),
-                mix(hue_g),
-                mix(hue_b),
-                alpha,
-            ));
+    let mut pixels = vec![Color32::TRANSPARENT; size * size];
+    // Generating the wheel is the one genuinely parallel part of the startup
+    // path: 768² pixels of atan2 and square root. Split it over the cores, one
+    // horizontal band per worker.
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .clamp(1, 16);
+    let rows = size.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for (band, rows_start) in pixels.chunks_mut(rows * size).zip((0..size).step_by(rows)) {
+            let hue_ring = &hue_ring;
+            scope.spawn(move || {
+                for (row, line) in band.chunks_mut(size).enumerate() {
+                    let y = rows_start + row;
+                    let dy = y as f32 + 0.5 - radius;
+                    for (x, pixel) in line.iter_mut().enumerate() {
+                        let dx = x as f32 + 0.5 - radius;
+                        let distance = (dx * dx + dy * dy).sqrt();
+                        let saturation = (distance / radius).clamp(0.0, 1.0);
+                        let angle = (-dy).atan2(dx);
+                        let index = ((angle.rem_euclid(std::f32::consts::TAU)
+                            * (HUE_STEPS as f32 / std::f32::consts::TAU))
+                            as usize)
+                            .min(HUE_STEPS - 1);
+                        let (hue_r, hue_g, hue_b) = hue_ring[index];
+                        let mix = |channel: u8| -> u8 {
+                            (255.0 + (channel as f32 - 255.0) * saturation).round() as u8
+                        };
+                        let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
+                        let alpha = (coverage * 255.0 + 0.5) as u8;
+                        *pixel = Color32::from_rgba_unmultiplied(
+                            mix(hue_r),
+                            mix(hue_g),
+                            mix(hue_b),
+                            alpha,
+                        );
+                    }
+                }
+            });
         }
-    }
+    });
     ColorImage::new([size, size], pixels)
 }
 
@@ -346,26 +362,58 @@ pub fn paint_background(
 }
 
 /// Ambient bloom behind the wheel, clipped to the content surface.
+///
+/// The original drew 16 nested circles at alpha 2, one per layer. Compositing
+/// `n` copies of a `2/255` alpha source is identical to a single source with
+/// alpha `1 - (1 - 2/255)^n`, so the whole bloom bakes into one radial ramp
+/// texture: a single textured quad instead of ~6000 thin triangles.
+pub fn glow_image(size: usize, accent: Color32) -> ColorImage {
+    const LAYERS: f32 = 15.0;
+    let mut alpha = [0.0f32; 17];
+    for (count, value) in alpha.iter_mut().enumerate() {
+        *value = 1.0 - (1.0 - 2.0 / 255.0f32).powi(count as i32);
+    }
+    let (ar, ag, ab) = (accent.r() as f32, accent.g() as f32, accent.b() as f32);
+    let mut pixels = Vec::with_capacity(size * size);
+    let half = size as f32 * 0.5;
+    for y in 0..size {
+        let v = (y as f32 + 0.5 - half) / half;
+        for x in 0..size {
+            let u = (x as f32 + 0.5 - half) / half;
+            let distance = (u * u + v * v).sqrt() * 1.55;
+            let coverage = if distance >= 1.55 {
+                0.0
+            } else {
+                let layers = (LAYERS * (1.55 - distance) / 0.72).floor() + 1.0;
+                alpha[(layers as usize).min(16)]
+            };
+            pixels.push(Color32::from_rgba_premultiplied(
+                (ar * coverage + 0.5) as u8,
+                (ag * coverage + 0.5) as u8,
+                (ab * coverage + 0.5) as u8,
+                (255.0 * coverage + 0.5) as u8,
+            ));
+        }
+    }
+    ColorImage::new([size, size], pixels)
+}
+
+/// Draw the baked bloom quad behind the wheel.
 pub fn paint_ambient_glow(
     painter: &Painter,
     layout: &Layout,
     metrics: &Metrics,
-    theme: &crate::theme::Theme,
+    glow: egui::TextureId,
 ) {
     let painter = painter.with_clip_rect(layout.content.intersect(layout.full));
-    let center = metrics.wheel_center;
-    let radius = metrics.wheel_radius;
-    let base = theme.accent;
-    // Many very faint layers give a smoother falloff than a few strong rings.
-    for layer in 0..16 {
-        let t = layer as f32 / 15.0;
-        let factor = 1.55 - 0.72 * t;
-        painter.circle_filled(
-            center,
-            radius * factor,
-            Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 2),
-        );
-    }
+    let half = metrics.wheel_radius * 1.55;
+    let rect = Rect::from_center_size(metrics.wheel_center, Vec2::splat(half * 2.0));
+    painter.image(
+        glow,
+        rect,
+        Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
 
 pub fn text_ellipsized(

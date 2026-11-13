@@ -6,5 +6,9 @@
 pub mod app;
 pub mod color;
 pub mod db;
+pub mod gfx;
+#[cfg(windows)]
+pub mod platform;
 pub mod theme;
+pub mod trace;
 pub mod ui;

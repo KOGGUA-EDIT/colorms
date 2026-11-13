@@ -86,6 +86,49 @@ fn over(dst: u32, r: u32, g: u32, b: u32, a: u32, inv: u32) -> u32 {
     (da.min(255) << 24) | (dr.min(255) << 16) | (dg.min(255) << 8) | db.min(255)
 }
 
+/// Blends one premultiplied source sample into `dst`, scaled by the pixel
+/// coverage `cov` (1.0 = the pixel is fully inside the span). The edge pixels of
+/// a span carry a fractional coverage so a shape narrower than one pixel still
+/// contributes its share of ink instead of disappearing between samples.
+#[inline(always)]
+fn shade_pixel(dst: &mut Texel, r: u32, g: u32, b: u32, a: u32, cov: f32) {
+    if a == 0 || cov <= 0.0 {
+        return;
+    }
+    let (r, g, b, a) = if cov >= 0.999 {
+        (r, g, b, a)
+    } else {
+        (
+            (r as f32 * cov + 0.5) as u32,
+            (g as f32 * cov + 0.5) as u32,
+            (b as f32 * cov + 0.5) as u32,
+            (a as f32 * cov + 0.5) as u32,
+        )
+    };
+    let a = a.min(255);
+    if a == 0 {
+        return;
+    }
+    if a >= 255 {
+        *dst = pack(r.min(255) as u8, g.min(255) as u8, b.min(255) as u8, 255);
+    } else {
+        *dst = over(*dst, r.min(255), g.min(255), b.min(255), a, 255 - a);
+    }
+}
+
+/// Same as [shade_pixel] for an already sampled premultiplied texel.
+#[inline(always)]
+fn shade_texel(dst: &mut Texel, src: Texel, cov: f32) {
+    shade_pixel(
+        dst,
+        (src >> 16) & 0xFF,
+        (src >> 8) & 0xFF,
+        src & 0xFF,
+        src >> 24,
+        cov,
+    );
+}
+
 #[derive(Clone, Copy, Default)]
 struct Clip {
     x0: i32,
@@ -511,13 +554,62 @@ impl Canvas {
             if !(xmin <= xmax) {
                 continue;
             }
-            let xs = ((xmin - 0.5).ceil() as i32).max(clip.x0);
-            let xe = ((xmax - 0.5).floor() as i32).min(clip.x1 - 1);
+            // Only the pixels whose centres the span covers used to be painted,
+            // so anything narrower than a pixel (the 1 px arc of a rounded
+            // corner is the worst case) vanished between samples and read as a
+            // dotted line. Spans wider than a pixel keep the old centre rule so
+            // abutting triangles still tile exactly; the thin ones are widened
+            // to every pixel they touch, with the edge alpha set to the covered
+            // fraction so the arc stays continuous instead of dotting.
+            let x_left = xmin.max(clip.x0 as f32);
+            let x_right = xmax.min(clip.x1 as f32);
+            if !(x_right > x_left) {
+                continue;
+            }
+            let thin = (x_right - x_left) < 1.0;
+            let (xs, xe) = if thin {
+                (
+                    (x_left.floor() as i32).max(clip.x0),
+                    ((x_right.ceil() as i32) - 1).min(clip.x1 - 1),
+                )
+            } else {
+                (
+                    ((x_left - 0.5).ceil() as i32).max(clip.x0),
+                    ((x_right - 0.5).floor() as i32).min(clip.x1 - 1),
+                )
+            };
             if xs > xe {
                 continue;
             }
             let row = y as usize * self.width as usize;
             let length = (xe - xs + 1) as usize;
+            let cov_first = if thin {
+                (xs as f32 + 1.0 - x_left).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let cov_last = if thin {
+                (x_right - xe as f32).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let full = length > 0 && cov_first >= 0.999 && cov_last >= 0.999;
+            let covered = if thin {
+                (x_right - x_left).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let cov_at = |index: usize| -> f32 {
+                if length == 1 {
+                    covered
+                } else if index == 0 {
+                    cov_first
+                } else if index + 1 == length {
+                    cov_last
+                } else {
+                    1.0
+                }
+            };
             self.filled += length as u64;
             self.spans += 1;
             let dx = xs as f32 + 0.5 - px0;
@@ -551,12 +643,51 @@ impl Canvas {
                     if *a == 255 {
                         self.px_solid_fill += length as u64;
                         let value = pack(*r as u8, *g as u8, *b as u8, 255);
-                        slice.fill(value);
+                        if full {
+                            slice.fill(value);
+                        } else if length == 1 {
+                            shade_pixel(&mut slice[0], *r, *g, *b, *a, covered);
+                        } else {
+                            // Fully covered interior stays a plain fill; only the
+                            // two fractional edge pixels get real blending.
+                            let first = if cov_first < 0.999 { xs + 1 } else { xs };
+                            let last = if cov_last < 0.999 { xe - 1 } else { xe };
+                            if first <= last {
+                                let from = row + first as usize;
+                                let to = row + last as usize;
+                                self.pixels[from..=to].fill(value);
+                            }
+                            if cov_first < 0.999 {
+                                shade_pixel(
+                                    &mut self.pixels[row + xs as usize],
+                                    *r,
+                                    *g,
+                                    *b,
+                                    *a,
+                                    cov_first,
+                                );
+                            }
+                            if cov_last < 0.999 {
+                                shade_pixel(
+                                    &mut self.pixels[row + xe as usize],
+                                    *r,
+                                    *g,
+                                    *b,
+                                    *a,
+                                    cov_last,
+                                );
+                            }
+                        }
                     } else {
                         self.px_solid_over += length as u64;
                         let inv = 255 - *a;
-                        for pixel in slice.iter_mut() {
-                            *pixel = over(*pixel, *r, *g, *b, *a, inv);
+                        for (index, pixel) in slice.iter_mut().enumerate() {
+                            let coverage = cov_at(index);
+                            if coverage >= 0.999 {
+                                *pixel = over(*pixel, *r, *g, *b, *a, inv);
+                            } else {
+                                shade_pixel(pixel, *r, *g, *b, *a, coverage);
+                            }
                         }
                     }
                 }
@@ -583,36 +714,88 @@ impl Canvas {
                         self.px_grad_row += length as u64;
                         let slice = &mut self.pixels[start..end];
                         if sa >= 255 {
-                            slice.fill(pack(r as u8, g as u8, b as u8, 255));
+                            if full {
+                                slice.fill(pack(r as u8, g as u8, b as u8, 255));
+                            } else {
+                                let value = pack(r as u8, g as u8, b as u8, 255);
+                                if length == 1 {
+                                    shade_pixel(&mut slice[0], r, g, b, sa, covered);
+                                } else {
+                                    let first = if cov_first < 0.999 { xs + 1 } else { xs };
+                                    let last = if cov_last < 0.999 { xe - 1 } else { xe };
+                                    if first <= last {
+                                        let from = (first - xs) as usize;
+                                        let to = (last - xs) as usize;
+                                        self.pixels[start + from..=start + to].fill(value);
+                                    }
+                                    if cov_first < 0.999 {
+                                        shade_pixel(
+                                            &mut self.pixels[start],
+                                            r,
+                                            g,
+                                            b,
+                                            sa,
+                                            cov_first,
+                                        );
+                                    }
+                                    if cov_last < 0.999 {
+                                        shade_pixel(
+                                            &mut self.pixels[row + xe as usize],
+                                            r,
+                                            g,
+                                            b,
+                                            sa,
+                                            cov_last,
+                                        );
+                                    }
+                                }
+                            }
                         } else {
                             let inv = 255 - sa;
-                            for pixel in slice.iter_mut() {
-                                *pixel = over(*pixel, r, g, b, sa, inv);
+                            for (index, pixel) in slice.iter_mut().enumerate() {
+                                let coverage = cov_at(index);
+                                if coverage >= 0.999 {
+                                    *pixel = over(*pixel, r, g, b, sa, inv);
+                                } else {
+                                    shade_pixel(pixel, r, g, b, sa, coverage);
+                                }
                             }
                         }
                         continue;
                     }
                     self.px_grad += length as u64;
-                    for pixel in &mut self.pixels[start..end] {
+                    for (index, pixel) in self.pixels[start..end].iter_mut().enumerate() {
                         let a = at[3];
+                        let coverage = cov_at(index);
                         if a > 0.5 {
-                            let sa = (a + 0.5) as u32;
-                            if sa >= 255 {
-                                *pixel = pack(
-                                    (at[0].clamp(0.0, a) + 0.5) as u8,
-                                    (at[1].clamp(0.0, a) + 0.5) as u8,
-                                    (at[2].clamp(0.0, a) + 0.5) as u8,
-                                    255,
-                                );
+                            if coverage >= 0.999 {
+                                let sa = (a + 0.5) as u32;
+                                if sa >= 255 {
+                                    *pixel = pack(
+                                        (at[0].clamp(0.0, a) + 0.5) as u8,
+                                        (at[1].clamp(0.0, a) + 0.5) as u8,
+                                        (at[2].clamp(0.0, a) + 0.5) as u8,
+                                        255,
+                                    );
+                                } else {
+                                    let inv = 255 - sa;
+                                    *pixel = over(
+                                        *pixel,
+                                        (at[0].clamp(0.0, a) + 0.5).min(255.0) as u32,
+                                        (at[1].clamp(0.0, a) + 0.5).min(255.0) as u32,
+                                        (at[2].clamp(0.0, a) + 0.5).min(255.0) as u32,
+                                        sa,
+                                        inv,
+                                    );
+                                }
                             } else {
-                                let inv = 255 - sa;
-                                *pixel = over(
-                                    *pixel,
-                                    (at[0].clamp(0.0, a) + 0.5).min(255.0) as u32,
-                                    (at[1].clamp(0.0, a) + 0.5).min(255.0) as u32,
-                                    (at[2].clamp(0.0, a) + 0.5).min(255.0) as u32,
-                                    sa,
-                                    inv,
+                                shade_pixel(
+                                    pixel,
+                                    at[0].clamp(0.0, a) as u32,
+                                    at[1].clamp(0.0, a) as u32,
+                                    at[2].clamp(0.0, a) as u32,
+                                    (a + 0.5).min(255.0) as u32,
+                                    coverage,
                                 );
                             }
                         }
@@ -643,17 +826,27 @@ impl Canvas {
                     if tint == Some([255, 255, 255, 255]) {
                         if linear {
                             self.px_tex_linear += length as u64;
-                            for pixel in slice.iter_mut() {
+                            for (index, pixel) in slice.iter_mut().enumerate() {
                                 let src = bilinear(pixels, texture_width, texture_height, fx, fy);
-                                blend_packed(pixel, src);
+                                let coverage = cov_at(index);
+                                if coverage >= 0.999 {
+                                    blend_packed(pixel, src);
+                                } else {
+                                    shade_texel(pixel, src, coverage);
+                                }
                                 fx += step_x;
                                 fy += step_y;
                             }
                         } else {
                             self.px_tex_nearest += length as u64;
-                            for pixel in slice.iter_mut() {
+                            for (index, pixel) in slice.iter_mut().enumerate() {
                                 let src = nearest(pixels, texture_width, texture_height, fx, fy);
-                                blend_packed(pixel, src);
+                                let coverage = cov_at(index);
+                                if coverage >= 0.999 {
+                                    blend_packed(pixel, src);
+                                } else {
+                                    shade_texel(pixel, src, coverage);
+                                }
                                 fx += step_x;
                                 fy += step_y;
                             }
@@ -678,7 +871,7 @@ impl Canvas {
                     } else {
                         self.px_tex_nearest += length as u64;
                     }
-                    for pixel in slice.iter_mut() {
+                    for (index, pixel) in slice.iter_mut().enumerate() {
                         let texel = if linear {
                             sample_bilinear(pixels, texture_width, texture_height, fx, fy, tint)
                         } else {
@@ -695,14 +888,19 @@ impl Canvas {
                         } else {
                             texel
                         };
-                        let a = src[3];
-                        if a != 0 {
-                            if a >= 255 {
-                                *pixel = pack(src[0] as u8, src[1] as u8, src[2] as u8, 255);
-                            } else {
-                                let inv = 255 - a;
-                                *pixel = over(*pixel, src[0], src[1], src[2], a, inv);
+                        let coverage = cov_at(index);
+                        if coverage >= 0.999 {
+                            let a = src[3];
+                            if a != 0 {
+                                if a >= 255 {
+                                    *pixel = pack(src[0] as u8, src[1] as u8, src[2] as u8, 255);
+                                } else {
+                                    let inv = 255 - a;
+                                    *pixel = over(*pixel, src[0], src[1], src[2], a, inv);
+                                }
                             }
+                        } else {
+                            shade_pixel(pixel, src[0], src[1], src[2], src[3], coverage);
                         }
                         fx += step_x;
                         fy += step_y;

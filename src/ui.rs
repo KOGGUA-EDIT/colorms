@@ -360,73 +360,101 @@ pub fn footer_hairline(painter: &Painter, rect: Rect) {
     );
 }
 
-/// One-pixel ring around the window chassis.
+/// Coverage mask for one corner of the window outline.
 ///
-/// A `rect_stroke` tessellates the corners into slivers narrower than a pixel;
-/// the CPU rasterizer cannot tile those exactly, so the arc came out dotted.
-/// The ring is therefore composed from axis-aligned 1 px strips plus a chain of
-/// small opaque squares stamped along each corner arc. Consecutive stamps
-/// overlap, and an overlap of the same opaque colour is invisible, so the arc
-/// is continuous no matter where the pixel grid falls.
-pub fn paint_window_border(painter: &Painter, full: Rect, color: Color32, radius: u8) {
-    let radius = (radius as f32)
-        .min(full.width() * 0.5)
-        .min(full.height() * 0.5);
-    let thick = 1.0;
+/// The mask is a small square holding the top-left quarter of a ring of width
+/// `thickness`, anti-aliased by the analytic distance to the two circle
+/// boundaries. Drawing the ring as an image lets the corners take their
+/// smoothness from texture filtering instead of from triangle fans, whose
+/// sub-pixel slivers the CPU rasterizer cannot tile without gaps.
+pub fn corner_ring_image(side: usize, radius: f32, thickness: f32) -> ColorImage {
+    let mut pixels = vec![Color32::TRANSPARENT; side * side];
+    let outer = radius;
+    let inner = radius - thickness;
+    for y in 0..side {
+        for x in 0..side {
+            let dx = x as f32 + 0.5 - radius;
+            let dy = y as f32 + 0.5 - radius;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let coverage =
+                (outer - distance + 0.5).clamp(0.0, 1.0) - (inner - distance + 0.5).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let alpha = (coverage * 255.0 + 0.5) as u8;
+            pixels[y * side + x] = Color32::from_rgba_premultiplied(alpha, alpha, alpha, alpha);
+        }
+    }
+    ColorImage::new([side, side], pixels)
+}
+
+/// One-pixel outline around the window chassis: four straight strips plus a
+/// pre-rendered anti-aliased corner mask, so the arc stays smooth and the
+/// outline stops exactly where the rounding starts (a full-length strip would
+/// square the corners off again).
+pub fn paint_window_border(
+    painter: &Painter,
+    full: Rect,
+    color: Color32,
+    radius: f32,
+    corner: egui::TextureId,
+) {
+    let radius = radius.min(full.width() * 0.5).min(full.height() * 0.5);
     if radius < 1.0 {
         painter.rect_filled(full.shrink(0.5), CornerRadius::ZERO, color);
         return;
     }
-    let arc = radius - thick * 0.5;
+    let thick = 1.0;
+    let (left, top, right, bottom) = (full.left(), full.top(), full.right(), full.bottom());
     painter.rect_filled(
-        Rect::from_min_max(full.left_top(), pos2(full.right(), full.top() + thick)),
+        Rect::from_min_max(pos2(left + radius, top), pos2(right - radius, top + thick)),
         CornerRadius::ZERO,
         color,
     );
     painter.rect_filled(
         Rect::from_min_max(
-            pos2(full.left(), full.bottom() - thick),
-            full.right_bottom(),
+            pos2(left + radius, bottom - thick),
+            pos2(right - radius, bottom),
         ),
         CornerRadius::ZERO,
         color,
     );
     painter.rect_filled(
-        Rect::from_min_max(full.left_top(), pos2(full.left() + thick, full.bottom())),
+        Rect::from_min_max(
+            pos2(left, top + radius),
+            pos2(left + thick, bottom - radius),
+        ),
         CornerRadius::ZERO,
         color,
     );
     painter.rect_filled(
-        Rect::from_min_max(pos2(full.right() - thick, full.top()), full.right_bottom()),
+        Rect::from_min_max(
+            pos2(right - thick, top + radius),
+            pos2(right, bottom - radius),
+        ),
         CornerRadius::ZERO,
         color,
     );
-    let stamp = Vec2::splat(1.4);
-    for (centre, start) in [
+    let side = radius.ceil() + 2.0;
+    for (rect, uv) in [
         (
-            pos2(full.left() + arc, full.top() + arc),
-            std::f32::consts::PI,
+            Rect::from_min_max(pos2(left, top), pos2(left + side, top + side)),
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
         ),
         (
-            pos2(full.right() - arc, full.top() + arc),
-            std::f32::consts::FRAC_PI_2 * 3.0,
+            Rect::from_min_max(pos2(right - side, top), pos2(right, top + side)),
+            Rect::from_min_max(pos2(1.0, 0.0), pos2(0.0, 1.0)),
         ),
         (
-            pos2(full.left() + arc, full.bottom() - arc),
-            std::f32::consts::FRAC_PI_2,
+            Rect::from_min_max(pos2(left, bottom - side), pos2(left + side, bottom)),
+            Rect::from_min_max(pos2(0.0, 1.0), pos2(1.0, 0.0)),
         ),
-        (pos2(full.right() - arc, full.bottom() - arc), 0.0),
+        (
+            Rect::from_min_max(pos2(right - side, bottom - side), pos2(right, bottom)),
+            Rect::from_min_max(pos2(1.0, 1.0), pos2(0.0, 0.0)),
+        ),
     ] {
-        let steps = ((arc * 2.0) as i32).max(6);
-        for step in 0..=steps {
-            let angle = start + std::f32::consts::FRAC_PI_2 * step as f32 / steps as f32;
-            let point = pos2(centre.x + angle.cos() * arc, centre.y + angle.sin() * arc);
-            painter.rect_filled(
-                Rect::from_center_size(point, stamp),
-                CornerRadius::ZERO,
-                color,
-            );
-        }
+        painter.image(corner, rect, uv, color);
     }
 }
 

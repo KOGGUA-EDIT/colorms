@@ -130,6 +130,9 @@ pub struct ColormsApp {
     /// Baked ambient bloom; regenerated when the accent colour changes.
     glow: Option<TextureHandle>,
     glow_key: [u8; 4],
+    /// Anti-aliased corner mask for the window outline.
+    border_corner: Option<TextureHandle>,
+    border_side: u32,
 
     dirty: bool,
     touched: bool,
@@ -198,6 +201,8 @@ impl ColormsApp {
             brand,
             glow: None,
             glow_key: [0; 4],
+            border_corner: None,
+            border_side: 0,
             dirty: false,
             touched: false,
             copied_hex: None,
@@ -297,6 +302,30 @@ impl ColormsApp {
         }
     }
 
+    /// Corner mask for the window outline, rebuilt only when the radius or the
+    /// display scale changes.
+    fn border_corner_texture(&mut self, ctx: &egui::Context, radius: f32) -> egui::TextureId {
+        let side = radius.ceil().max(1.0) + 2.0;
+        let key = side as u32;
+        if self.border_corner.is_none() || self.border_side != key {
+            let image = ui::corner_ring_image(side as usize, radius, 1.0);
+            match &mut self.border_corner {
+                Some(handle) => handle.set(image, egui::TextureOptions::LINEAR),
+                None => {
+                    self.border_corner = Some(ctx.load_texture(
+                        "colorms-border",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            }
+            self.border_side = key;
+        }
+        self.border_corner
+            .as_ref()
+            .map_or(egui::TextureId::default(), |handle| handle.id())
+    }
+
     /// Keep the ambient bloom in sync with the accent colour.
     fn glow_texture(&mut self, ctx: &egui::Context, accent: Color32) -> egui::TextureId {
         let key = accent.to_array();
@@ -333,7 +362,6 @@ impl ColormsApp {
         let glow = self.glow_texture(ctx, theme.accent);
         ui::paint_ambient_glow(&painter, &layout, &metrics, glow);
         ui::titlebar_hairline(&painter, layout.title);
-        ui::footer_hairline(&painter, layout.footer);
 
         self.draw_wheel(ctx, ui, &layout, &metrics, &theme);
         self.draw_brightness(ctx, ui, &layout, &metrics, &theme);
@@ -346,12 +374,9 @@ impl ColormsApp {
         self.draw_resize_handles(ctx, ui, &layout, maximized);
 
         if !maximized {
-            ui::paint_window_border(
-                &painter,
-                layout.full,
-                theme.window_border,
-                ui::WINDOW_RADIUS,
-            );
+            let radius = ui::WINDOW_RADIUS as f32;
+            let corner = self.border_corner_texture(ctx, radius);
+            ui::paint_window_border(&painter, layout.full, theme.window_border, radius, corner);
         }
     }
 

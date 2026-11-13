@@ -10,6 +10,8 @@ use eframe::egui::{
     FontFamily, Id, PointerButton, Rect, ResizeDirection, Sense, Stroke, StrokeKind, TextureHandle,
     TextureOptions, Ui, Vec2, ViewportCommand, pos2, vec2,
 };
+#[cfg(target_os = "windows")]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::color::PickerColor;
 use crate::db::{Db, RECENT_LIMIT, StoredColor};
@@ -119,6 +121,10 @@ pub struct ColormsApp {
     last_size_change: Instant,
     startup: Instant,
     startup_logged: bool,
+    #[cfg(target_os = "windows")]
+    window_handle: Option<isize>,
+    #[cfg(target_os = "windows")]
+    applied_region: Option<(i32, i32, i32, bool)>,
 }
 
 impl ColormsApp {
@@ -132,6 +138,14 @@ impl ColormsApp {
         assets: StartupAssets,
     ) -> Self {
         let ctx = &cc.egui_ctx;
+        #[cfg(target_os = "windows")]
+        let window_handle = cc
+            .window_handle()
+            .ok()
+            .and_then(|handle| match handle.as_raw() {
+                RawWindowHandle::Win32(window) => Some(window.hwnd.get() as isize),
+                _ => None,
+            });
         tracing::info!(
             ms = startup.elapsed().as_secs_f64() * 1000.0,
             "startup: app::new enter"
@@ -193,6 +207,10 @@ impl ColormsApp {
             last_size_change: Instant::now(),
             startup,
             startup_logged: false,
+            #[cfg(target_os = "windows")]
+            window_handle,
+            #[cfg(target_os = "windows")]
+            applied_region: None,
         };
         if let Some(note) = db_note {
             app.pending_toast = Some((note, 3.6));
@@ -280,6 +298,59 @@ impl ColormsApp {
                 Err(err) => tracing::warn!("failed to save window size: {err}"),
             }
             self.last_size_change = Instant::now();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn update_rounded_region(&mut self, ctx: &egui::Context, maximized: bool) {
+        let Some(hwnd) = self.window_handle else {
+            return;
+        };
+        let mut rect = win32_region::Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { win32_region::GetClientRect(hwnd, &mut rect) } == 0 {
+            return;
+        }
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        // A rounded window region removes the square, black corners that DWM
+        // leaves behind around the transparent chassis on Windows.
+        let radius = if maximized {
+            0
+        } else {
+            (ui::WINDOW_RADIUS as f32 * ctx.pixels_per_point()).round() as i32
+        };
+        let key = (width, height, radius, maximized);
+        if self.applied_region == Some(key) {
+            return;
+        }
+        if radius <= 0 {
+            if unsafe { win32_region::SetWindowRgn(hwnd, 0, 1) } != 0 {
+                self.applied_region = Some(key);
+            }
+            return;
+        }
+        let region = unsafe {
+            win32_region::CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2)
+        };
+        if region == 0 {
+            return;
+        }
+        if unsafe { win32_region::SetWindowRgn(hwnd, region, 1) } != 0 {
+            self.applied_region = Some(key);
+        } else {
+            // SetWindowRgn did not take ownership on failure.
+            unsafe {
+                win32_region::DeleteObject(region);
+            }
+            self.applied_region = None;
         }
     }
 
@@ -1052,6 +1123,8 @@ impl eframe::App for ColormsApp {
             return;
         }
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        #[cfg(target_os = "windows")]
+        self.update_rounded_region(ctx, maximized);
         self.track_size(full.size(), maximized);
 
         if let Some((text, duration)) = self.pending_toast.take() {
@@ -1209,4 +1282,29 @@ fn build_font_definitions() -> FontDefinitions {
         "prepared system fonts"
     );
     fonts
+}
+
+#[cfg(target_os = "windows")]
+mod win32_region {
+    #[repr(C)]
+    pub struct Rect {
+        pub left: i32,
+        pub top: i32,
+        pub right: i32,
+        pub bottom: i32,
+    }
+
+    unsafe extern "system" {
+        pub fn GetClientRect(hwnd: isize, rect: *mut Rect) -> i32;
+        pub fn SetWindowRgn(hwnd: isize, region: isize, redraw: i32) -> i32;
+        pub fn CreateRoundRectRgn(
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+            width: i32,
+            height: i32,
+        ) -> isize;
+        pub fn DeleteObject(object: isize) -> i32;
+    }
 }

@@ -17,7 +17,8 @@
   点击圆点恢复，右键删除。
 - **动态主题**：背景、复制按钮、描边随当前颜色生成 Material You 暗色配色。
 - **无边框自适应窗口**：自定义标题栏 / 最小化 / 最大化 / 关闭，
-  6px 边缘拖拽调整大小，圆角与透明背景。最底部固定为 `#202020`。
+  6px 边缘拖拽调整大小；Windows 下用窗口区域（`SetWindowRgn`）裁出圆角，
+  避免透明窗口在 DWM 下出现黑角。最底部固定为 `#202020`。
 
 ## 快捷键
 
@@ -48,7 +49,7 @@
 
 需要 Rust 1.88+ 和可用的 C 工具链（`rusqlite` 的 bundled SQLite 需要 `cc`）。
 Windows 上可以用 MSVC Build Tools，或者 GNU 目标 + w64devkit。
-当前主要针对 Windows（透明无边框窗口、系统字体加载按 Windows 调优）。
+当前主要针对 Windows（无边框窗口、圆角窗口区域、系统字体加载按 Windows 调优）。
 
 ```powershell
 cargo run            # 开发运行

@@ -6,6 +6,7 @@
 //! path. This shell never creates a graphics device — the whole cold start is
 //! window creation, font loading and one rasterized frame.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use egui::Color32;
@@ -16,7 +17,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Icon, Window, WindowId};
 
 use crate::app::{ColormsApp, Command, StartupAssets};
-use crate::color::PickerColor;
+use crate::color::{PickerColor, Rgb8};
 use crate::db::Db;
 use crate::gfx::Canvas;
 use crate::trace;
@@ -113,6 +114,7 @@ struct Host {
     app: Option<ColormsApp>,
     canvas: Canvas,
     surface: Option<Surface>,
+    eyedropper: Option<Eyedropper>,
     next_repaint: Option<Instant>,
     shown: bool,
     icon_set: bool,
@@ -130,6 +132,7 @@ impl Host {
             app: None,
             canvas: Canvas::new(),
             surface: None,
+            eyedropper: None,
             next_repaint: None,
             shown: false,
             icon_set: false,
@@ -343,6 +346,7 @@ impl Host {
                 Command::Minimize => window.set_minimized(true),
                 Command::ToggleMaximize => window.set_maximized(!maximized),
                 Command::Close => {
+                    self.eyedropper = None;
                     app.persist_now();
                     event_loop.exit();
                 }
@@ -352,6 +356,14 @@ impl Host {
                 Command::Resize(direction) => {
                     let _ = window.drag_resize_window(map_direction(direction));
                 }
+                Command::StartEyedropper => {
+                    if self.eyedropper.is_none() {
+                        self.eyedropper = Some(Eyedropper::start(window_handle(window)));
+                    }
+                }
+                Command::CancelEyedropper => {
+                    self.eyedropper = None;
+                }
             }
         }
 
@@ -360,7 +372,11 @@ impl Host {
             .get(&egui::ViewportId::ROOT)
             .map(|viewport| viewport.repaint_delay)
             .unwrap_or(Duration::MAX);
-        if delay.is_zero() {
+        if self.eyedropper.is_some() {
+            let at = Instant::now() + Duration::from_millis(16);
+            self.next_repaint = Some(at);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+        } else if delay.is_zero() {
             self.next_repaint = None;
             event_loop.set_control_flow(ControlFlow::Wait);
             window.request_redraw();
@@ -421,7 +437,48 @@ impl ApplicationHandler for Host {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(eyedropper) = self.eyedropper.as_mut() {
+            let now = self
+                .ctx
+                .as_ref()
+                .map_or(0.0, |ctx| ctx.input(|i| i.time));
+            match eyedropper.poll() {
+                EyedropperEvent::None => {}
+                EyedropperEvent::Preview(rgb) => {
+                    if let Some(app) = self.app.as_mut() {
+                        app.preview_eyedropper_color(rgb);
+                    }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+                EyedropperEvent::Confirm(rgb) => {
+                    self.eyedropper = None;
+                    if let Some(app) = self.app.as_mut() {
+                        app.confirm_eyedropper(rgb, now);
+                    }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+                EyedropperEvent::Cancel => {
+                    self.eyedropper = None;
+                    if let Some(app) = self.app.as_mut() {
+                        app.cancel_eyedropper(now);
+                    }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+            }
+            if self.eyedropper.is_some() {
+                let at = Instant::now() + Duration::from_millis(16);
+                self.next_repaint = Some(at);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+                return;
+            }
+        }
         let Some(at) = self.next_repaint else {
             return;
         };
@@ -434,6 +491,7 @@ impl ApplicationHandler for Host {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.eyedropper = None;
         if let Some(app) = self.app.as_mut() {
             app.persist_now();
         }
@@ -723,10 +781,24 @@ const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOSIZE: u32 = 0x0001;
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
+const HWND_TOPMOST: isize = -1;
+const HWND_NOTOPMOST: isize = -2;
+const WH_MOUSE_LL: i32 = 14;
+const WM_LBUTTONDOWN: usize = 0x0201;
+const WM_RBUTTONDOWN: usize = 0x0204;
+const VK_ESCAPE: i32 = 0x1B;
+const CLR_INVALID: u32 = 0xFFFF_FFFF;
+
+type HookProc = unsafe extern "system" fn(code: i32, wparam: usize, lparam: isize) -> isize;
 
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetWindowRect(hwnd: isize, rect: *mut LayerRect) -> i32;
+    fn GetCursorPos(point: *mut LayerPoint) -> i32;
+    fn GetAsyncKeyState(vkey: i32) -> i16;
+    fn SetWindowsHookExW(id_hook: i32, lpfn: HookProc, hmod: isize, thread_id: u32) -> isize;
+    fn UnhookWindowsHookEx(hhk: isize) -> i32;
+    fn CallNextHookEx(hhk: isize, code: i32, wparam: usize, lparam: isize) -> isize;
     fn UpdateLayeredWindow(
         hwnd: isize,
         dst: Hdc,
@@ -770,6 +842,7 @@ unsafe extern "system" {
     fn SelectObject(hdc: Hdc, object: isize) -> isize;
     fn DeleteObject(object: isize) -> i32;
     fn CreateSolidBrush(color: u32) -> isize;
+    fn GetPixel(hdc: Hdc, x: i32, y: i32) -> u32;
 }
 
 #[link(name = "dwmapi")]
@@ -911,5 +984,151 @@ impl Foreground {
             Self::set_layered(hwnd);
             restored
         }
+    }
+}
+
+/// Shared signal written by the low-level mouse hook during eyedropper mode:
+/// `0` = sampling, `1` = left-click confirm, `2` = right-click cancel.
+static EYEDROPPER_ACTION: AtomicU8 = AtomicU8::new(0);
+
+unsafe extern "system" fn eyedropper_mouse_proc(
+    code: i32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    if code >= 0 {
+        match wparam {
+            WM_LBUTTONDOWN => {
+                EYEDROPPER_ACTION.store(1, Ordering::SeqCst);
+                // Swallow the click so sampling over another window does not
+                // activate its buttons or links.
+                return 1;
+            }
+            WM_RBUTTONDOWN => {
+                EYEDROPPER_ACTION.store(2, Ordering::SeqCst);
+                return 1;
+            }
+            _ => {}
+        }
+    }
+    unsafe { CallNextHookEx(0, code, wparam, lparam) }
+}
+
+enum EyedropperEvent {
+    None,
+    Preview(Rgb8),
+    Confirm(Rgb8),
+    Cancel,
+}
+
+/// RAII Windows screen colour picker.
+///
+/// Keeps the Colorms window temporarily topmost as a live colour monitor,
+/// samples the pixel under the cursor from the desktop DC, and installs a
+/// low-level mouse hook so left-click confirms without clicking through to
+/// underlying apps and right-click/Esc cancels cleanly.
+struct Eyedropper {
+    hwnd: isize,
+    hook: isize,
+    last_pos: Option<(i32, i32)>,
+    last_rgb: Option<Rgb8>,
+}
+
+impl Eyedropper {
+    fn start(hwnd: isize) -> Self {
+        EYEDROPPER_ACTION.store(0, Ordering::SeqCst);
+        let hook = unsafe {
+            if hwnd != 0 {
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+            SetWindowsHookExW(WH_MOUSE_LL, eyedropper_mouse_proc, 0, 0)
+        };
+        Self {
+            hwnd,
+            hook,
+            last_pos: None,
+            last_rgb: None,
+        }
+    }
+
+    fn poll(&mut self) -> EyedropperEvent {
+        let esc_down = unsafe { (GetAsyncKeyState(VK_ESCAPE) as u16 & 0x8000) != 0 };
+        if esc_down {
+            return EyedropperEvent::Cancel;
+        }
+        let action = EYEDROPPER_ACTION.swap(0, Ordering::SeqCst);
+        if action == 2 {
+            return EyedropperEvent::Cancel;
+        }
+        let mut pt = LayerPoint { x: 0, y: 0 };
+        let got_pos = unsafe { GetCursorPos(&mut pt) != 0 };
+        if action == 1 {
+            let rgb = if got_pos {
+                sample_screen_pixel(pt.x, pt.y).or(self.last_rgb)
+            } else {
+                self.last_rgb
+            };
+            return match rgb {
+                Some(rgb) => EyedropperEvent::Confirm(rgb),
+                None => EyedropperEvent::Cancel,
+            };
+        }
+        if got_pos && self.last_pos != Some((pt.x, pt.y)) {
+            self.last_pos = Some((pt.x, pt.y));
+            if let Some(rgb) = sample_screen_pixel(pt.x, pt.y) {
+                self.last_rgb = Some(rgb);
+                return EyedropperEvent::Preview(rgb);
+            }
+        }
+        EyedropperEvent::None
+    }
+}
+
+impl Drop for Eyedropper {
+    fn drop(&mut self) {
+        EYEDROPPER_ACTION.store(0, Ordering::SeqCst);
+        unsafe {
+            if self.hook != 0 {
+                UnhookWindowsHookEx(self.hook);
+            }
+            if self.hwnd != 0 {
+                SetWindowPos(
+                    self.hwnd,
+                    HWND_NOTOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+}
+
+fn sample_screen_pixel(x: i32, y: i32) -> Option<Rgb8> {
+    unsafe {
+        let hdc = GetDC(0);
+        if hdc == 0 {
+            return None;
+        }
+        let raw = GetPixel(hdc, x, y);
+        ReleaseDC(0, hdc);
+        if raw == CLR_INVALID {
+            return None;
+        }
+        Some(Rgb8::new(
+            (raw & 0xFF) as u8,
+            ((raw >> 8) & 0xFF) as u8,
+            ((raw >> 16) & 0xFF) as u8,
+        ))
     }
 }

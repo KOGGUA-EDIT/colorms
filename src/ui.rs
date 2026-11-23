@@ -78,7 +78,8 @@ impl Layout {
     }
 }
 
-/// Positions lifted straight out of the VectorCraft document.
+/// Positions lifted from the VectorCraft document, extended with the MD3
+/// top-right eyedropper and redesigned copy action button.
 #[derive(Debug, Clone, Copy)]
 pub struct Metrics {
     pub brightness: Rect,
@@ -88,9 +89,8 @@ pub struct Metrics {
     pub preview_center: Pos2,
     pub preview_radius: f32,
     pub hex_pill: Rect,
-    pub copy_front: Rect,
-    pub copy_back: Rect,
-    pub copy_radius: f32,
+    pub eyedropper: Rect,
+    pub copy_button: Rect,
     pub pill_radius: f32,
 }
 
@@ -100,8 +100,11 @@ impl Metrics {
         let wheel = layout.rect(108.129, 46.620, 467.871, 406.362);
         let preview_center = layout.point(174.614, 457.660);
         let hex_pill = layout.rect(320.672, 485.145, 467.871, 524.145);
-        let copy_front = layout.rect(473.121, 374.018, 527.999, 450.334);
-        let copy_back = layout.rect(487.972, 362.390, 542.851, 438.706);
+        // Right action column (centered at x = 516, symmetric to brightness
+        // capsule on the left): top-right 44dp MD3 Icon Button for the screen
+        // eyedropper, and lower-right 56dp MD3 Primary Action Button for copy.
+        let eyedropper = layout.rect(494.0, 46.620, 538.0, 90.620);
+        let copy_button = layout.rect(488.0, 380.0, 544.0, 436.0);
         Self {
             brightness,
             wheel,
@@ -110,15 +113,10 @@ impl Metrics {
             preview_center,
             preview_radius: layout.len(66.485),
             hex_pill,
-            copy_front,
-            copy_back,
-            copy_radius: layout.len(13.196),
-            pill_radius: layout.len(18.300),
+            eyedropper,
+            copy_button,
+            pill_radius: layout.len(19.5),
         }
-    }
-
-    pub fn copy_union(&self) -> Rect {
-        self.copy_front.union(self.copy_back)
     }
 }
 
@@ -345,6 +343,78 @@ pub fn paint_close_icon(painter: &Painter, center: Pos2, size: f32, color: Color
     );
 }
 
+/// Material Symbols `content_copy` icon (24dp optical grid scaled to `size`).
+pub fn paint_copy_icon(painter: &Painter, center: Pos2, size: f32, color: Color32) {
+    let u = size / 24.0;
+    let stroke = Stroke::new((1.9 * u).clamp(1.4, 2.8), color);
+    let r = CornerRadius::same((2.4 * u).round().clamp(1.0, 6.0) as u8);
+
+    // Front sheet (bottom-right)
+    let front = Rect::from_min_max(
+        center + vec2(-3.5 * u, -4.0 * u),
+        center + vec2(8.5 * u, 10.0 * u),
+    );
+    painter.rect_stroke(front, r, stroke, StrokeKind::Middle);
+
+    // Back sheet (top-left L-bracket so it never crosses into the front sheet)
+    let bx0 = center.x - 8.5 * u;
+    let by0 = center.y - 9.5 * u;
+    let bx1 = center.x + 3.5 * u;
+    let by1 = center.y + 4.5 * u;
+    let cr = 2.4 * u;
+    let back_pts = vec![
+        pos2(bx0, by1),
+        pos2(bx0, by0 + cr),
+        pos2(bx0 + cr * 0.3, by0 + cr * 0.3),
+        pos2(bx0 + cr, by0),
+        pos2(bx1, by0),
+    ];
+    painter.add(egui::Shape::line(back_pts, stroke));
+}
+
+/// Material Symbols `check` icon shown after copying.
+pub fn paint_check_icon(painter: &Painter, center: Pos2, size: f32, color: Color32) {
+    let u = size / 24.0;
+    let stroke = Stroke::new((2.2 * u).clamp(1.6, 3.2), color);
+    let pts = vec![
+        center + vec2(-7.0 * u, 0.5 * u),
+        center + vec2(-2.0 * u, 5.5 * u),
+        center + vec2(7.5 * u, -5.0 * u),
+    ];
+    painter.add(egui::Shape::line(pts, stroke));
+}
+
+/// Material Symbols `colorize` (eyedropper / pipette) icon on a 24dp grid.
+pub fn paint_eyedropper_icon(painter: &Painter, center: Pos2, size: f32, color: Color32) {
+    let u = size / 24.0;
+    let stroke = Stroke::new((1.8 * u).clamp(1.3, 2.6), color);
+
+    // 45-degree rotated local frame: `a` points along the barrel toward the
+    // top-right bulb, `p` is perpendicular.
+    let a = vec2(std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2);
+    let p = vec2(std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+    let pt = |along: f32, perp: f32| center + a * (along * u) + p * (perp * u);
+
+    // Tapered glass barrel + tip (outlined polygon)
+    let barrel = vec![
+        pt(-9.5, 0.0),
+        pt(-6.8, -2.3),
+        pt(2.6, -2.3),
+        pt(2.6, 2.3),
+        pt(-6.8, 2.3),
+    ];
+    painter.add(egui::Shape::closed_line(barrel, stroke));
+
+    // Collar crossbar between barrel and bulb
+    painter.line_segment([pt(2.6, -4.4), pt(2.6, 4.4)], Stroke::new((2.0 * u).clamp(1.5, 2.8), color));
+
+    // Rounded rubber bulb at the top-right end
+    let bulb_end = pt(7.0, 0.0);
+    let bulb_start = pt(3.2, 0.0);
+    painter.line_segment([bulb_start, bulb_end], Stroke::new((5.0 * u).clamp(3.2, 7.0), color));
+    painter.circle_filled(bulb_end, (2.5 * u).clamp(1.6, 3.5), color);
+}
+
 /// Tiny centered hairline used to separate the custom titlebar.
 pub fn titlebar_hairline(painter: &Painter, rect: Rect) {
     painter.hline(
@@ -362,24 +432,66 @@ pub fn footer_hairline(painter: &Painter, rect: Rect) {
     );
 }
 
-/// Coverage mask for one corner of the window outline.
-///
-/// The mask is a small square holding the top-left quarter of a ring of width
-/// `thickness`, anti-aliased by the analytic distance to the two circle
-/// boundaries. Drawing the ring as an image lets the corners take their
-/// smoothness from texture filtering instead of from triangle fans, whose
-/// sub-pixel slivers the CPU rasterizer cannot tile without gaps.
+/// Analytic SDF anti-aliased rounded-rectangle outline mask (white
+/// premultiplied alpha). Evaluated as a single signed-distance field so the
+/// straight edges and corner arcs are mathematically seamless with zero
+/// tangent-point cracks.
+pub fn round_rect_ring_image(
+    width: usize,
+    height: usize,
+    radius: f32,
+    thickness: f32,
+) -> ColorImage {
+    let width = width.max(4);
+    let height = height.max(4);
+    let mut pixels = vec![Color32::TRANSPARENT; width * height];
+    let half_w = width as f32 * 0.5;
+    let half_h = height as f32 * 0.5;
+    // Leave 0.5 px margin so the outer AA fringe never clips at the texture edge.
+    let bx = (half_w - 0.5).max(1.0);
+    let by = (half_h - 0.5).max(1.0);
+    let r = radius.min(bx).min(by).max(0.0);
+    let inner_bx = bx - r;
+    let inner_by = by - r;
+    for y in 0..height {
+        let py = (y as f32 + 0.5 - half_h).abs();
+        for x in 0..width {
+            let px = (x as f32 + 0.5 - half_w).abs();
+            let qx = px - inner_bx;
+            let qy = py - inner_by;
+            // Exact signed distance to the outer rounded-rect boundary
+            // (negative inside, 0 on boundary, positive outside).
+            let sd = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt()
+                + qx.max(qy).min(0.0)
+                - r;
+            let outer_cov = (0.5 - sd).clamp(0.0, 1.0);
+            let inner_cov = (0.5 - (sd + thickness)).clamp(0.0, 1.0);
+            let coverage = (outer_cov - inner_cov).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let alpha = (coverage * 255.0 + 0.5) as u8;
+            pixels[y * width + x] = Color32::from_rgba_premultiplied(alpha, alpha, alpha, alpha);
+        }
+    }
+    ColorImage::new([width, height], pixels)
+}
+
+/// Coverage mask for one corner of a large rounded-rectangle stroke (the
+/// window chassis outline).
 pub fn corner_ring_image(side: usize, radius: f32, thickness: f32) -> ColorImage {
     let mut pixels = vec![Color32::TRANSPARENT; side * side];
     let outer = radius;
-    let inner = radius - thickness;
+    let inner = (radius - thickness).max(0.0);
     for y in 0..side {
+        let py = y as f32 + 0.5;
         for x in 0..side {
-            let dx = x as f32 + 0.5 - radius;
-            let dy = y as f32 + 0.5 - radius;
+            let px = x as f32 + 0.5;
+            let dx = px - radius;
+            let dy = py - radius;
             let distance = (dx * dx + dy * dy).sqrt();
-            let coverage =
-                (outer - distance + 0.5).clamp(0.0, 1.0) - (inner - distance + 0.5).clamp(0.0, 1.0);
+            let coverage = (outer - distance + 0.5).clamp(0.0, 1.0)
+                - (inner - distance + 0.5).clamp(0.0, 1.0);
             if coverage <= 0.0 {
                 continue;
             }
@@ -390,64 +502,96 @@ pub fn corner_ring_image(side: usize, radius: f32, thickness: f32) -> ColorImage
     ColorImage::new([side, side], pixels)
 }
 
-/// One-pixel outline around the window chassis: four straight strips plus a
-/// pre-rendered anti-aliased corner mask, so the arc stays smooth and the
-/// outline stops exactly where the rounding starts (a full-length strip would
-/// square the corners off again).
-pub fn paint_window_border(
+/// Analytic SDF anti-aliased circle ring mask (white premultiplied alpha).
+///
+/// Tint it with any `Color32` at draw time for razor-smooth circular outlines
+/// (colour wheel rim, swatch border, circular icon buttons) with zero aliasing.
+pub fn circle_ring_image(size: usize, thickness: f32) -> ColorImage {
+    let size = size.max(4);
+    let mut pixels = vec![Color32::TRANSPARENT; size * size];
+    let center = size as f32 * 0.5;
+    let outer = center - 0.5;
+    let inner = (outer - thickness).max(0.0);
+    for y in 0..size {
+        let dy = y as f32 + 0.5 - center;
+        for x in 0..size {
+            let dx = x as f32 + 0.5 - center;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let coverage = (outer - distance + 0.5).clamp(0.0, 1.0)
+                - (inner - distance + 0.5).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let alpha = (coverage * 255.0 + 0.5) as u8;
+            pixels[y * size + x] = Color32::from_rgba_premultiplied(alpha, alpha, alpha, alpha);
+        }
+    }
+    ColorImage::new([size, size], pixels)
+}
+
+/// Draw an analytic anti-aliased circular outline centred at `center`.
+pub fn paint_circle_ring(
     painter: &Painter,
-    full: Rect,
+    center: Pos2,
+    diameter: f32,
     color: Color32,
+    ring_tex: egui::TextureId,
+) {
+    let rect = Rect::from_center_size(center, Vec2::splat(diameter));
+    painter.image(
+        ring_tex,
+        rect,
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        color,
+    );
+}
+
+/// Analytic anti-aliased rounded-rectangle outline built from four exact
+/// quarter-circle SDF corner masks and four non-overlapping straight strips.
+pub fn paint_round_rect_stroke(
+    painter: &Painter,
+    rect: Rect,
     radius: f32,
     thick: f32,
     side: f32,
+    color: Color32,
     corner: egui::TextureId,
 ) {
-    let radius = radius.min(full.width() * 0.5).min(full.height() * 0.5);
+    let radius = radius.min(rect.width() * 0.5).min(rect.height() * 0.5);
     if radius < 1.0 {
-        painter.rect_filled(full.shrink(0.5), CornerRadius::ZERO, color);
+        painter.rect_stroke(rect, CornerRadius::ZERO, Stroke::new(thick, color), StrokeKind::Inside);
         return;
     }
-    let (left, top, right, bottom) = (full.left(), full.top(), full.right(), full.bottom());
-    // The strips run a little past the tangent points and the corner masks are
-    // painted first, so their union has no seam wherever the arc lands on the
-    // pixel grid. They are drawn opaque for the same reason: an overlap of the
-    // same opaque colour is invisible, while a translucent overlap would double
-    // blend into a darker wedge at every corner.
-    let over = thick;
-    painter.rect_filled(
-        Rect::from_min_max(
-            pos2(left + radius - over, top),
-            pos2(right - radius + over, top + thick),
-        ),
-        CornerRadius::ZERO,
-        color,
-    );
-    painter.rect_filled(
-        Rect::from_min_max(
-            pos2(left + radius - over, bottom - thick),
-            pos2(right - radius + over, bottom),
-        ),
-        CornerRadius::ZERO,
-        color,
-    );
-    painter.rect_filled(
-        Rect::from_min_max(
-            pos2(left, top + radius - over),
-            pos2(left + thick, bottom - radius + over),
-        ),
-        CornerRadius::ZERO,
-        color,
-    );
-    painter.rect_filled(
-        Rect::from_min_max(
-            pos2(right - thick, top + radius - over),
-            pos2(right, bottom - radius + over),
-        ),
-        CornerRadius::ZERO,
-        color,
-    );
-    for (rect, uv) in [
+    let (left, top, right, bottom) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    let side = side.min(rect.width() * 0.5).min(rect.height() * 0.5);
+
+    // Four straight strips stopping cleanly at the corner tangent lines.
+    if right - left > side * 2.0 + 0.01 {
+        painter.rect_filled(
+            Rect::from_min_max(pos2(left + side, top), pos2(right - side, top + thick)),
+            CornerRadius::ZERO,
+            color,
+        );
+        painter.rect_filled(
+            Rect::from_min_max(pos2(left + side, bottom - thick), pos2(right - side, bottom)),
+            CornerRadius::ZERO,
+            color,
+        );
+    }
+    if bottom - top > side * 2.0 + 0.01 {
+        painter.rect_filled(
+            Rect::from_min_max(pos2(left, top + side), pos2(left + thick, bottom - side)),
+            CornerRadius::ZERO,
+            color,
+        );
+        painter.rect_filled(
+            Rect::from_min_max(pos2(right - thick, top + side), pos2(right, bottom - side)),
+            CornerRadius::ZERO,
+            color,
+        );
+    }
+
+    for (quad, uv) in [
         (
             Rect::from_min_max(pos2(left, top), pos2(left + side, top + side)),
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
@@ -465,8 +609,21 @@ pub fn paint_window_border(
             Rect::from_min_max(pos2(1.0, 1.0), pos2(0.0, 0.0)),
         ),
     ] {
-        painter.image(corner, rect, uv, color);
+        painter.image(corner, quad, uv, color);
     }
+}
+
+/// Alias kept for the window chassis outline.
+pub fn paint_window_border(
+    painter: &Painter,
+    full: Rect,
+    color: Color32,
+    radius: f32,
+    thick: f32,
+    side: f32,
+    corner: egui::TextureId,
+) {
+    paint_round_rect_stroke(painter, full, radius, thick, side, color, corner);
 }
 
 /// The full-window rounded chassis plus the adaptive content gradient.

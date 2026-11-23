@@ -6,6 +6,7 @@
 //! different, so the app no longer needs eframe, winit's GL bridge or a GPU
 //! driver at startup.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -13,13 +14,13 @@ use std::time::{Duration, Instant};
 
 use egui::{
     self, Align2, Color32, ColorImage, CornerRadius, CursorIcon, FontData, FontDefinitions,
-    FontFamily, Id, PointerButton, Rect, ResizeDirection, Sense, TextureHandle, TextureOptions, Ui,
-    Vec2, pos2, vec2,
+    FontFamily, Id, PointerButton, Pos2, Rect, ResizeDirection, Sense, TextureHandle,
+    TextureOptions, Ui, Vec2, pos2, vec2,
 };
 
-use crate::color::PickerColor;
+use crate::color::{PickerColor, Rgb8};
 use crate::db::Db;
-use crate::theme::{self, Theme};
+use crate::theme::{self, STATE_HOVER, STATE_PRESSED, Theme};
 use crate::trace;
 use crate::ui::{self, FONT_DISPLAY, FONT_MONO, Layout, Metrics};
 
@@ -39,6 +40,8 @@ pub enum Command {
     Close,
     StartDrag,
     Resize(ResizeDirection),
+    StartEyedropper,
+    CancelEyedropper,
 }
 
 struct Toast {
@@ -129,15 +132,23 @@ pub struct ColormsApp {
     /// Baked ambient bloom; regenerated when the accent colour changes.
     glow: Option<TextureHandle>,
     glow_key: [u8; 4],
-    /// Anti-aliased corner mask for the window outline.
-    border_corner: Option<TextureHandle>,
-    border_side: u32,
+    /// Analytic SDF anti-aliased corner masks for the window chassis border.
+    corner_rings: HashMap<(u32, u32), TextureHandle>,
+    /// Analytic SDF anti-aliased rounded-rect rings for controls, keyed by
+    /// `(w_px, h_px, radius_px, thick_tenths)`.
+    round_rect_rings: HashMap<(u32, u32, u32, u32), TextureHandle>,
+    /// Analytic SDF anti-aliased full circle rings keyed by `(diameter_px, thick_tenths)`.
+    circle_rings: HashMap<(u32, u32), TextureHandle>,
 
     dirty: bool,
     touched: bool,
-    /// Hex value that was last copied from the card/pill; the copy card turns
-    /// into a filled accent button while this still matches the selection.
+    /// Hex value that was last copied; the primary copy button shows the
+    /// confirmed checkmark state while this matches the active selection.
     copied_hex: Option<String>,
+    /// True while the Windows screen eyedropper is actively sampling pixels.
+    eyedropper_active: bool,
+    /// Colour snapshot saved before eyedropper started, restored on cancel.
+    eyedropper_saved_color: Option<PickerColor>,
     last_size: Vec2,
     persisted_size: Vec2,
     last_size_change: Instant,
@@ -190,11 +201,14 @@ impl ColormsApp {
             brand,
             glow: None,
             glow_key: [0; 4],
-            border_corner: None,
-            border_side: 0,
+            corner_rings: HashMap::new(),
+            round_rect_rings: HashMap::new(),
+            circle_rings: HashMap::new(),
             dirty: false,
             touched: false,
             copied_hex: None,
+            eyedropper_active: false,
+            eyedropper_saved_color: None,
             last_size: vec2(initial_size[0], initial_size[1]),
             persisted_size: vec2(initial_size[0], initial_size[1]),
             last_size_change: Instant::now(),
@@ -271,47 +285,167 @@ impl ColormsApp {
         }
     }
 
-    /// Corner mask for the window outline.
+    pub fn is_eyedropper_active(&self) -> bool {
+        self.eyedropper_active
+    }
+
+    fn toggle_eyedropper(&mut self, now: f64) {
+        if self.eyedropper_active {
+            self.cancel_eyedropper(now);
+        } else {
+            self.eyedropper_saved_color = Some(self.color);
+            self.eyedropper_active = true;
+            self.commands.push(Command::StartEyedropper);
+            self.show_toast("移动鼠标吸色，左键确认，右键/Esc 取消".to_owned(), now);
+        }
+    }
+
+    /// Live-preview a pixel sampled from the screen while eyedropper is active.
+    pub fn preview_eyedropper_color(&mut self, rgb: Rgb8) {
+        if !self.eyedropper_active {
+            return;
+        }
+        let next = PickerColor::from_rgb(rgb);
+        if next.rgb() != self.color.rgb() {
+            self.color = next;
+        }
+    }
+
+    /// Confirm the sampled screen colour and exit eyedropper mode.
+    pub fn confirm_eyedropper(&mut self, rgb: Rgb8, now: f64) {
+        self.eyedropper_active = false;
+        self.eyedropper_saved_color = None;
+        self.color = PickerColor::from_rgb(rgb);
+        let hex = self.color.hex();
+        self.dirty = true;
+        let saved = self.commit(now);
+        if saved {
+            self.show_toast(format!("已吸取 {hex}"), now);
+        }
+    }
+
+    /// Cancel eyedropper mode and restore the colour from before picking.
+    pub fn cancel_eyedropper(&mut self, now: f64) {
+        if !self.eyedropper_active {
+            return;
+        }
+        self.eyedropper_active = false;
+        if let Some(prev) = self.eyedropper_saved_color.take() {
+            self.color = prev;
+        }
+        self.commands.push(Command::CancelEyedropper);
+        self.show_toast("已取消吸色".to_owned(), now);
+    }
+
+    /// Paint an analytic SDF anti-aliased rounded-rectangle outline.
     ///
-    /// The mask is generated in **physical pixels** and drawn at exactly that
-    /// many pixels (the quad back in points is `side / ppp`), so every texel
-    /// lands on one device pixel. Generating it in points and letting the
-    /// composite scale it shifted the arc by half a texel against the straight
-    /// segments, which read as the outline being one pixel out at the corners.
-    fn border_corner_texture(
+    /// Small/medium controls use a single seamless SDF texture so the straight
+    /// sides and corner arcs never show a tangent-point seam; the full-window
+    /// chassis border uses 4 corner masks + 4 strips to keep texture memory
+    /// tiny.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_round_outline(
         &mut self,
         ctx: &egui::Context,
+        painter: &egui::Painter,
+        rect: Rect,
         radius: f32,
-        thickness: f32,
-        ppp: f32,
-    ) -> (egui::TextureId, f32) {
-        let radius_px = (radius * ppp).round().max(2.0);
-        // Half a pixel of optical correction: an anti-aliased band of exactly
-        // `thickness` pixels only has `thickness - 1` fully covered pixels once
-        // it runs diagonally, so the arc would read thinner than the straight
-        // parts of the same outline.
-        let thickness_px = (thickness * ppp + 0.5).max(1.0);
-        let side_px = radius_px + 2.0;
-        let key = side_px as u32;
-        if self.border_corner.is_none() || self.border_side != key {
-            let image = ui::corner_ring_image(side_px as usize, radius_px, thickness_px);
-            match &mut self.border_corner {
-                Some(handle) => handle.set(image, egui::TextureOptions::LINEAR),
-                None => {
-                    self.border_corner = Some(ctx.load_texture(
-                        "colorms-border",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
-                }
+        thickness_dp: f32,
+        color: Color32,
+    ) {
+        let ppp = ctx.pixels_per_point();
+        let clamped_radius = radius
+            .min(rect.width() * 0.5)
+            .min(rect.height() * 0.5)
+            .max(0.0);
+        let w_px = (rect.width() * ppp).round().max(4.0) as u32 + 2;
+        let h_px = (rect.height() * ppp).round().max(4.0) as u32 + 2;
+        let thickness_px = (thickness_dp * ppp).max(1.0);
+
+        if w_px <= 480 && h_px <= 480 {
+            let radius_px = (clamped_radius * ppp).round();
+            let key = (w_px, h_px, radius_px as u32, (thickness_px * 10.0).round() as u32);
+            if self.round_rect_rings.len() > 32 && !self.round_rect_rings.contains_key(&key) {
+                self.round_rect_rings.clear();
             }
-            self.border_side = key;
+            let handle = self.round_rect_rings.entry(key).or_insert_with(|| {
+                let image = ui::round_rect_ring_image(
+                    w_px as usize,
+                    h_px as usize,
+                    radius_px,
+                    thickness_px,
+                );
+                ctx.load_texture(
+                    format!("colorms-rr-{}-{}-{}-{}", key.0, key.1, key.2, key.3),
+                    image,
+                    TextureOptions::LINEAR,
+                )
+            });
+            let draw_rect = Rect::from_center_size(
+                rect.center(),
+                vec2(w_px as f32 / ppp, h_px as f32 / ppp),
+            );
+            painter.image(
+                handle.id(),
+                draw_rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                color,
+            );
+            return;
         }
-        let id = self
-            .border_corner
-            .as_ref()
-            .map_or(egui::TextureId::default(), |handle| handle.id());
-        (id, side_px / ppp)
+
+        let radius_px = (clamped_radius * ppp).round().max(2.0);
+        let side_px = radius_px as usize;
+        let key = (side_px as u32, (thickness_px * 10.0).round() as u32);
+        if self.corner_rings.len() > 16 && !self.corner_rings.contains_key(&key) {
+            self.corner_rings.clear();
+        }
+        let handle = self.corner_rings.entry(key).or_insert_with(|| {
+            let image = ui::corner_ring_image(side_px, radius_px, thickness_px);
+            ctx.load_texture(
+                format!("colorms-corner-{}-{}", key.0, key.1),
+                image,
+                TextureOptions::LINEAR,
+            )
+        });
+        ui::paint_round_rect_stroke(
+            painter,
+            rect,
+            clamped_radius,
+            thickness_px / ppp,
+            side_px as f32 / ppp,
+            color,
+            handle.id(),
+        );
+    }
+
+    /// Paint an analytic SDF anti-aliased circular outline centred at `center`.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_circle_outline(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        center: Pos2,
+        radius: f32,
+        thickness_dp: f32,
+        color: Color32,
+    ) {
+        let ppp = ctx.pixels_per_point();
+        let diameter_px = ((radius * 2.0 * ppp).round().max(8.0) as u32) + 2;
+        let thickness_px = (thickness_dp * ppp).max(1.0);
+        let key = (diameter_px, (thickness_px * 10.0).round() as u32);
+        if self.circle_rings.len() > 24 && !self.circle_rings.contains_key(&key) {
+            self.circle_rings.clear();
+        }
+        let handle = self.circle_rings.entry(key).or_insert_with(|| {
+            let image = ui::circle_ring_image(diameter_px as usize, thickness_px);
+            ctx.load_texture(
+                format!("colorms-ring-{}-{}", key.0, key.1),
+                image,
+                TextureOptions::LINEAR,
+            )
+        });
+        ui::paint_circle_ring(painter, center, diameter_px as f32 / ppp, color, handle.id());
     }
 
     /// Keep the ambient bloom in sync with the accent colour.
@@ -353,30 +487,18 @@ impl ColormsApp {
 
         self.draw_wheel(ctx, ui, &layout, &metrics, &theme);
         self.draw_brightness(ctx, ui, &layout, &metrics, &theme);
-        self.draw_preview(&painter, &metrics);
+        self.draw_preview(ctx, &painter, &metrics, &theme);
         self.draw_hex_pill(ctx, ui, &layout, &metrics, &theme, now);
-        self.draw_copy_card(ctx, ui, &layout, &metrics, &theme, now);
+        self.draw_eyedropper_button(ctx, ui, &layout, &metrics, &theme, now);
+        self.draw_copy_button(ctx, ui, &layout, &metrics, &theme, now);
         self.draw_titlebar(ctx, ui, &layout, &theme, &painter, maximized);
         self.draw_toast(ctx, &painter, &layout, &theme, now);
         self.draw_resize_handles(ctx, ui, &layout, maximized);
 
         if !maximized {
             let radius = ui::WINDOW_RADIUS as f32;
-            let ppp = ctx.pixels_per_point();
-            let (corner, side) = self.border_corner_texture(ctx, radius, 2.0, ppp);
-            // The strips overlap the corner masks so their union has no seam, and
-            // an overlap is only invisible when both are painted with the same
-            // opaque colour — so the translucent outline colour is flattened onto
-            // the chassis colour first.
-            ui::paint_window_border(
-                &painter,
-                layout.full,
-                flatten(theme.window_border, theme.footer),
-                radius,
-                2.0 / ppp,
-                side,
-                corner,
-            );
+            let border_color = flatten(theme.window_border, theme.footer);
+            self.paint_round_outline(ctx, &painter, layout.full, radius, 1.5, border_color);
         }
     }
 
@@ -396,6 +518,11 @@ impl ColormsApp {
         if response.hovered() || response.dragged() {
             ctx.set_cursor_icon(CursorIcon::Crosshair);
         }
+        let hover = ctx.animate_bool_with_time(
+            Id::new("colorms-wheel-hover"),
+            response.hovered() || response.dragged(),
+            0.15,
+        );
         if response.is_pointer_button_down_on() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let delta = pos - center;
@@ -421,15 +548,18 @@ impl ColormsApp {
         }
 
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-        ui.painter()
-            .image(self.wheel.id(), rect, uv, Color32::WHITE);
+        let painter = ui.painter().clone();
+        painter.image(self.wheel.id(), rect, uv, Color32::WHITE);
+
+        // Restored smooth analytic SDF rim outline around the colour wheel.
+        let rim_color = theme::lerp_color(theme.outline_variant, theme.outline_emphasis, hover);
+        self.paint_circle_outline(ctx, &painter, center, radius, 1.25, rim_color);
 
         let angle = self.color.hue.to_radians();
         let marker_center =
             center + vec2(angle.cos(), -angle.sin()) * (self.color.saturation * radius);
         let marker_radius = (10.0 * layout.scale).clamp(7.0, 14.0);
         let ring = (3.0 * layout.scale).clamp(2.0, 4.5);
-        let painter = ui.painter();
         painter.circle_filled(
             marker_center + vec2(0.0, 1.5),
             marker_radius + 1.0,
@@ -456,6 +586,11 @@ impl ColormsApp {
         if response.hovered() || response.dragged() {
             ctx.set_cursor_icon(CursorIcon::ResizeVertical);
         }
+        let hover = ctx.animate_bool_with_time(
+            Id::new("colorms-brightness-hover"),
+            response.hovered() || response.is_pointer_button_down_on(),
+            0.14,
+        );
         if response.is_pointer_button_down_on() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let t = ((pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
@@ -469,8 +604,13 @@ impl ColormsApp {
         }
 
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-        let painter = ui.painter();
+        let painter = ui.painter().clone();
         painter.image(self.slider.id(), rect, uv, Color32::WHITE);
+
+        // Restored smooth analytic SDF capsule outline so the dark bottom
+        // edge stays crisp against the dark surface.
+        let border_color = theme::lerp_color(theme.outline_variant, theme.outline_emphasis, hover);
+        self.paint_round_outline(ctx, &painter, rect, rect.width() * 0.5, 1.25, border_color);
 
         // A small knob on the wheel side of the capsule makes the current
         // brightness obvious at a glance and mirrors Material sliders.
@@ -480,10 +620,6 @@ impl ColormsApp {
         );
         let knob_radius = (6.5 * layout.scale).clamp(4.5, 10.0);
         let ring = (1.6 * layout.scale).clamp(1.0, 2.2);
-        // Concentric discs instead of two `circle_stroke` calls: a 1–2 px ring
-        // is tessellated into sub-pixel slivers that the rasterizer can only
-        // approximate, which read as a frayed outline. Opaque discs stack
-        // cleanly and leave a crisp ring.
         painter.circle_filled(knob_center + vec2(0.0, 1.5), knob_radius, theme.shadow);
         painter.circle_filled(
             knob_center,
@@ -498,15 +634,23 @@ impl ColormsApp {
         );
     }
 
-    fn draw_preview(&self, painter: &egui::Painter, metrics: &Metrics) {
+    fn draw_preview(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        metrics: &Metrics,
+        theme: &Theme,
+    ) {
         let center = metrics.preview_center;
         let radius = metrics.preview_radius.max(2.0);
         painter.circle_filled(
             center + vec2(0.0, 2.0),
             radius,
-            Color32::from_black_alpha(90),
+            Color32::from_black_alpha(72),
         );
         painter.circle_filled(center, radius, theme::color32(self.color.rgb()));
+        // Restored analytic SDF ring so dark swatches remain clearly bounded.
+        self.paint_circle_outline(ctx, painter, center, radius, 1.25, theme.outline_variant);
     }
 
     fn draw_hex_pill(
@@ -525,37 +669,43 @@ impl ColormsApp {
         }
         let hover =
             ctx.animate_bool_with_time(Id::new("colorms-hex-hover"), response.hovered(), 0.12);
+        let pressed = ctx.animate_bool_with_time(
+            Id::new("colorms-hex-pressed"),
+            response.is_pointer_button_down_on(),
+            0.08,
+        );
         if response.clicked() {
             self.copy_current(ctx, now);
         }
-        let painter = ui.painter();
-        // The pill stays visible through its fill alone: the design's outlines
-        // were dropped so the control area reads as flat Material surfaces.
-        // The layer is flattened onto the backdrop and drawn opaque because the
-        // rounded caps are composed from rects and discs, whose overlaps would
-        // otherwise blend twice.
-        let fill = over_backdrop(
-            layout,
-            metrics,
-            theme,
-            rect.center(),
-            theme::lerp_color(theme.surface, theme.surface_hover, hover),
+        let painter = ui.painter().clone();
+        // MD3 Outlined / Tonal pill: surface-container-high + on-surface state
+        // layer (8% hover, 10% pressed) + analytic SDF outline-variant border.
+        let mut fill = theme::apply_state_layer(
+            theme.surface_container_high,
+            theme.on_surface,
+            STATE_HOVER * hover,
         );
-        ui::fill_round_rect(painter, rect, metrics.pill_radius, fill);
-        let font_size = (16.0 * layout.scale).clamp(13.0, 23.0);
+        if pressed > 0.001 {
+            fill = theme::apply_state_layer(fill, theme.on_surface, STATE_PRESSED * pressed);
+        }
+        let pill_radius = metrics.pill_radius.min(rect.height() * 0.5);
+        ui::fill_round_rect(&painter, rect, pill_radius, fill);
+        let border_color = theme::lerp_color(theme.outline_variant, theme.outline_emphasis, hover);
+        self.paint_round_outline(ctx, &painter, rect, pill_radius, 1.25, border_color);
+
+        let font_size = (15.0 * layout.scale).clamp(13.0, 22.0);
         let font = ui::font_mono(font_size);
-        // Optical centring: the text layout box includes descender space, so
-        // CENTER_CENTER puts a digits-only string a few pixels too high.
         painter.text(
-            rect.center() + vec2(0.0, font_size * 0.17),
+            rect.center() + vec2(0.0, font_size * 0.14),
             Align2::CENTER_CENTER,
             self.color.hex(),
             font,
-            theme.text,
+            theme.on_surface,
         );
     }
 
-    fn draw_copy_card(
+    /// Top-right MD3 Outlined / Toggle Icon Button for the screen eyedropper.
+    fn draw_eyedropper_button(
         &mut self,
         ctx: &egui::Context,
         ui: &Ui,
@@ -564,48 +714,138 @@ impl ColormsApp {
         theme: &Theme,
         now: f64,
     ) {
-        let response = ui.interact(
-            metrics.copy_union(),
-            Id::new("colorms-copy"),
-            Sense::click(),
+        let visual_rect = metrics.eyedropper;
+        // Enforce MD3 >= 48x48dp touch target around the 44dp visual icon button.
+        let hit_size = visual_rect.size().max(Vec2::splat(48.0 * layout.scale));
+        let hit_rect = Rect::from_center_size(visual_rect.center(), hit_size);
+        let response = ui.interact(hit_rect, Id::new("colorms-eyedropper"), Sense::click());
+        if response.hovered() {
+            ctx.set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if response.clicked() {
+            self.toggle_eyedropper(now);
+        }
+
+        let hover = ctx.animate_bool_with_time(
+            Id::new("colorms-eyedropper-hover"),
+            response.hovered(),
+            0.12,
         );
+        let pressed = ctx.animate_bool_with_time(
+            Id::new("colorms-eyedropper-pressed"),
+            response.is_pointer_button_down_on(),
+            0.08,
+        );
+        let active = ctx.animate_bool_with_time(
+            Id::new("colorms-eyedropper-active"),
+            self.eyedropper_active,
+            0.16,
+        );
+
+        let painter = ui.painter().clone();
+        // M3 Expressive shape morphing: full circle at rest -> 12dp rounded
+        // square when pressed or toggled active.
+        let full_radius = visual_rect.width() * 0.5;
+        let square_radius = layout.len(12.0);
+        let morph = active.max(pressed * 0.85);
+        let radius = full_radius + (square_radius - full_radius) * morph;
+
+        let base_fill = theme::lerp_color(theme.surface_container_low, theme.accent_container, active);
+        let fg = theme::lerp_color(
+            theme::lerp_color(theme.on_surface_variant, theme.on_surface, hover),
+            theme.on_accent_container,
+            active,
+        );
+        let mut fill = theme::apply_state_layer(base_fill, fg, STATE_HOVER * hover);
+        if pressed > 0.001 {
+            fill = theme::apply_state_layer(fill, fg, STATE_PRESSED * pressed);
+        }
+        ui::fill_round_rect(&painter, visual_rect, radius, fill);
+
+        let rest_border = theme::lerp_color(theme.outline_variant, theme.outline_emphasis, hover);
+        let border_color = theme::lerp_color(rest_border, theme.primary, active);
+        let border_width = 1.25 + 0.5 * active;
+        self.paint_round_outline(ctx, &painter, visual_rect, radius, border_width, border_color);
+
+        let icon_size = layout.len(22.0).clamp(16.0, 30.0);
+        ui::paint_eyedropper_icon(&painter, visual_rect.center(), icon_size, fg);
+    }
+
+    /// Redesigned MD3 Primary Action Button (Regular 56dp FAB / Filled Tonal
+    /// Icon Button) — the single primary action on screen.
+    fn draw_copy_button(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &Ui,
+        layout: &Layout,
+        metrics: &Metrics,
+        theme: &Theme,
+        now: f64,
+    ) {
+        let rect = metrics.copy_button;
+        let response = ui.interact(rect, Id::new("colorms-copy"), Sense::click());
         if response.hovered() {
             ctx.set_cursor_icon(CursorIcon::PointingHand);
         }
         let hover =
-            ctx.animate_bool_with_time(Id::new("colorms-copy-hover"), response.hovered(), 0.14);
+            ctx.animate_bool_with_time(Id::new("colorms-copy-hover"), response.hovered(), 0.12);
+        let pressed = ctx.animate_bool_with_time(
+            Id::new("colorms-copy-pressed"),
+            response.is_pointer_button_down_on(),
+            0.08,
+        );
         if response.clicked() {
             self.copy_current(ctx, now);
         }
 
-        let painter = ui.painter();
+        let painter = ui.painter().clone();
         let hex = self.color.hex();
-        let copied = self.copied_hex.as_deref() == Some(hex.as_str());
-        let copied = ctx.animate_bool_with_time(Id::new("colorms-copy-filled"), copied, 0.18);
+        let is_copied = self.copied_hex.as_deref() == Some(hex.as_str());
+        let copied = ctx.animate_bool_with_time(Id::new("colorms-copy-filled"), is_copied, 0.18);
 
-        // Two flat sheets instead of two outlines: the back sheet is a darker
-        // surface, the front one sits on top and masks it where they overlap,
-        // so the pair still reads as the folded-corner copy glyph. A successful
-        // copy lifts the front sheet to white instead of recolouring a stroke.
-        let front_layer = theme::lerp_color(theme.surface_hover, theme.surface_pressed, hover);
-        let front_layer = theme::lerp_color(front_layer, Color32::from_white_alpha(190), copied);
-        let back_layer = theme::lerp_color(theme.surface, theme.surface_hover, hover);
-        let front = over_backdrop(
-            layout,
-            metrics,
-            theme,
-            metrics.copy_front.center(),
-            front_layer,
+        // MD3 Shape scale & Expressive Shape Morphing:
+        // Regular FAB 16dp (large) -> 12dp (medium) on press -> full circle on copied.
+        let base_radius = layout.len(16.0);
+        let pressed_radius = layout.len(12.0);
+        let copied_radius = rect.width() * 0.5;
+        let radius = (base_radius + (copied_radius - base_radius) * copied)
+            + (pressed_radius - base_radius) * pressed * (1.0 - copied);
+
+        // MD3 colour roles: primary-container / on-primary-container at rest,
+        // transitioning cleanly to primary / on-primary when copied.
+        let container = theme::lerp_color(theme.accent_container, theme.primary, copied);
+        let on_container = theme::lerp_color(theme.on_accent_container, theme.on_primary, copied);
+
+        // State layer: 8% hover + 10% pressed using the foreground on-* role.
+        let mut fill = theme::apply_state_layer(container, on_container, STATE_HOVER * hover);
+        if pressed > 0.001 {
+            fill = theme::apply_state_layer(fill, on_container, STATE_PRESSED * pressed);
+        }
+
+        // Subtle Level-1 elevation shadow (pure black <= 20% alpha), tucked
+        // cleanly inside the button silhouette so it never shows as a hard line.
+        ui::fill_round_rect(
+            &painter,
+            rect.shrink(0.5).translate(vec2(0.0, 2.0)),
+            (radius - 0.5).max(0.0),
+            Color32::from_black_alpha(44),
         );
-        let back = over_backdrop(
-            layout,
-            metrics,
-            theme,
-            metrics.copy_back.center(),
-            back_layer,
+        ui::fill_round_rect(&painter, rect, radius, fill);
+
+        // Crisp 1.25px analytic SDF outline matching the restored stroke language.
+        let border_color = theme::lerp_color(
+            theme::lerp_color(theme.outline_variant, theme.outline_emphasis, hover),
+            theme.primary,
+            copied * 0.65,
         );
-        ui::fill_round_rect(painter, metrics.copy_back, metrics.copy_radius, back);
-        ui::fill_round_rect(painter, metrics.copy_front, metrics.copy_radius, front);
+        self.paint_round_outline(ctx, &painter, rect, radius, 1.25, border_color);
+
+        let icon_size = layout.len(24.0).clamp(18.0, 34.0);
+        if copied > 0.5 {
+            ui::paint_check_icon(&painter, rect.center(), icon_size, on_container);
+        } else {
+            ui::paint_copy_icon(&painter, rect.center(), icon_size, on_container);
+        }
     }
 
     fn draw_titlebar(
@@ -772,31 +1012,37 @@ impl ColormsApp {
         if alpha <= 0.001 {
             return;
         }
-        let font = ui::font_body(12.0);
+        // MD3 Snackbar: extra-small 4dp radius, inverse-surface / inverse-on-surface.
+        let font = ui::font_body(13.0);
         let max_width = (layout.full.width() - 48.0).max(80.0);
-        let text_color = Color32::from_rgba_unmultiplied(230, 225, 235, (238.0 * alpha) as u8);
+        let fg = theme.inverse_on_surface;
+        let text_color = Color32::from_rgba_unmultiplied(
+            fg.r(),
+            fg.g(),
+            fg.b(),
+            (255.0 * alpha) as u8,
+        );
         let galley = painter.layout(toast.text.clone(), font, text_color, max_width);
         let size = galley.size();
-        let padding = vec2(14.0, 8.0);
-        let rect_size = size + padding * 2.0;
+        let padding = vec2(16.0, 10.0);
+        let rect_size = vec2(size.x + padding.x * 2.0, (size.y + padding.y * 2.0).max(40.0));
         let slide = (1.0 - alpha) * 6.0;
         let center = pos2(
             layout.full.center().x,
             layout.footer.top() - 20.0 - rect_size.y * 0.5 - slide,
         );
         let rect = Rect::from_center_size(center, rect_size);
+        let bg = theme.inverse_surface;
+        painter.rect_filled(
+            rect.translate(vec2(0.0, 2.0)),
+            CornerRadius::same(4),
+            Color32::from_black_alpha((64.0 * alpha) as u8),
+        );
         painter.rect_filled(
             rect,
-            CornerRadius::same(rect_size.y.min(24.0).round() as u8),
-            Color32::from_rgba_unmultiplied(
-                theme.toast_bg.r(),
-                theme.toast_bg.g(),
-                theme.toast_bg.b(),
-                (240.0 * alpha) as u8,
-            ),
+            CornerRadius::same(4),
+            Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), (246.0 * alpha) as u8),
         );
-        // Flat surface: the old 1 px outline was tessellated into sub-pixel
-        // slivers and read as a frayed edge around the bubble.
         painter.galley(rect.center() - size * 0.5, galley, text_color);
         ctx.request_repaint();
     }
@@ -934,8 +1180,15 @@ impl ColormsApp {
         if copy_requested {
             self.copy_current(ctx, now);
         }
+        if ctx.input(|i| !i.modifiers.command && !i.modifiers.alt && i.key_pressed(egui::Key::I)) {
+            self.toggle_eyedropper(now);
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.toast = None;
+            if self.eyedropper_active {
+                self.cancel_eyedropper(now);
+            } else {
+                self.toast = None;
+            }
         }
 
         egui::CentralPanel::default()
@@ -961,12 +1214,6 @@ impl ColormsApp {
     }
 }
 
-fn gradient_color_at(layout: &Layout, theme: &Theme, y: f32) -> Color32 {
-    let height = layout.content.height().max(1.0);
-    let t = ((y - layout.content.top()) / height).clamp(0.0, 1.0);
-    theme::lerp_color(theme.surface_top, theme.surface_bottom, t)
-}
-
 /// Composites a premultiplied layer over an opaque colour and drops the alpha
 /// channel. Overlapping translucent geometry (epaint's fan seams, for instance)
 /// becomes invisible once the result is opaque.
@@ -983,8 +1230,6 @@ fn over_premultiplied(top: Color32, under: Color32) -> Color32 {
 }
 
 /// Blends a translucent colour over an opaque one and drops the alpha channel.
-/// Used where an opaque result is required — overlapping translucent pieces
-/// double-blend at the seams, so the window outline is resolved up front.
 fn flatten(color: Color32, under: Color32) -> Color32 {
     let a = color.a() as u32;
     let rest = 255 - a;
@@ -994,46 +1239,6 @@ fn flatten(color: Color32, under: Color32) -> Color32 {
         mix(color.r(), under.r()),
         mix(color.g(), under.g()),
         mix(color.b(), under.b()),
-    )
-}
-
-/// Flattens a translucent surface layer onto everything painted behind it (the
-/// window gradient plus the ambient bloom) so the result can be painted opaque.
-/// Translucent figures drawn as triangle fans smear at the seams where two
-/// triangles share an edge, so flat controls are resolved here instead of at
-/// blend time.
-fn over_backdrop(
-    layout: &Layout,
-    metrics: &Metrics,
-    theme: &Theme,
-    pos: egui::Pos2,
-    layer: Color32,
-) -> Color32 {
-    let base = gradient_color_at(layout, theme, pos.y);
-    let radius = metrics.wheel_radius.max(1.0);
-    let dx = (pos.x - metrics.wheel_center.x) / radius;
-    let dy = (pos.y - metrics.wheel_center.y) / radius;
-    // The bloom quad spans `wheel_radius * 1.55`, so its own uv radius is
-    // `sqrt(dx^2 + dy^2)` — the 1.55 factor already sits in the quad size.
-    let distance = (dx * dx + dy * dy).sqrt();
-    let coverage = if distance >= 1.55 {
-        0.0
-    } else {
-        let layers = (15.0f32 * (1.55 - distance) / 0.72).floor() + 1.0;
-        1.0 - (1.0 - 2.0 / 255.0_f32).powi((layers as i32).min(16))
-    };
-    let accent = theme.accent;
-    // `layer` is premultiplied (epaint stores surfaces that way), so a plain
-    // src-over is just `layer + under * (1 - alpha)`.
-    let inverse = 1.0 - layer.a() as f32 / 255.0;
-    let flatten = |premult: u8, bloom: u8, back: u8| -> u8 {
-        let under = bloom as f32 * coverage + back as f32 * (1.0 - coverage);
-        (premult as f32 + under * inverse + 0.5) as u8
-    };
-    Color32::from_rgb(
-        flatten(layer.r(), accent.r(), base.r()),
-        flatten(layer.g(), accent.g(), base.g()),
-        flatten(layer.b(), accent.b(), base.b()),
     )
 }
 
